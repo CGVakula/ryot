@@ -147,7 +147,6 @@ export default function Page() {
 	}>();
 	const [opened, { open, close }] = useDisclosure(false);
 	const fetcher = useFetcher();
-	const deleteFormRef = useRef<HTMLFormElement>(null);
 
 	useEffect(() => {
 		if (transition.state !== "submitting") {
@@ -174,8 +173,10 @@ export default function Page() {
 						</ActionIcon>
 					</Flex>
 					<SimpleGrid cols={{ base: 1, md: 2 }}>
-						{loaderData.collections.map((c) => (
-							<Flex
+						{loaderData.collections.map((c) => {
+							const deleteFormRef = useRef<HTMLFormElement>(null);
+
+							return (<Flex
 								key={c.id}
 								align="center"
 								justify="space-between"
@@ -235,8 +236,8 @@ export default function Page() {
 										</ActionIcon>
 									</fetcher.Form>
 								</Flex>
-							</Flex>
-						))}
+							</Flex>)
+						})}
 					</SimpleGrid>
 				</Stack>
 			</Container>

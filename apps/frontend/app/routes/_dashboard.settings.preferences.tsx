@@ -273,7 +273,6 @@ export default function Page() {
 							<SimpleGrid cols={2} style={{ alignItems: "center" }}>
 								{(
 									[
-										"displayNsfw",
 										"disableYankIntegrations",
 										"disableNavigationAnimation",
 										"disableVideos",
@@ -284,10 +283,6 @@ export default function Page() {
 										key={name}
 										size="xs"
 										label={match(name)
-											.with(
-												"displayNsfw",
-												() => "Whether NSFW will be displayed",
-											)
 											.with(
 												"disableYankIntegrations",
 												() => "Disable yank integrations",

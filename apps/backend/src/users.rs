@@ -300,7 +300,7 @@ impl Default for UserGeneralPreferences {
     fn default() -> Self {
         Self {
             review_scale: UserReviewScale::default(),
-            display_nsfw: true,
+            display_nsfw: false,
             dashboard: vec![
                 UserGeneralDashboardElement {
                     section: DashboardElementLot::Upcoming,

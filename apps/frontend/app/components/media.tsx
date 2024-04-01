@@ -935,17 +935,7 @@ export const PostReviewModal = (props: {
 };
 
 export const NewUserGuideAlert = () => {
-	return (
-		<Alert icon={<IconArrowsRight />} variant="outline" color="teal">
-			<Text>
-				To get started, select a media type from the sidebar, enter a query in
-				the search tab, and add a media to your seen history or watchlist.
-			</Text>
-			<Text mt="xs">
-				This notice will disappear once your summary is re-calculated.
-			</Text>
-		</Alert>
-	);
+	return;
 };
 
 export const MediaIsPartial = (props: { mediaType: string }) => {

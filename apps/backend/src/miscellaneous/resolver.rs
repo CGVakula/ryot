@@ -27,6 +27,11 @@ use markdown::{
     Options,
 };
 use nanoid::nanoid;
+use openidconnect::{
+    core::{CoreClient, CoreResponseType},
+    reqwest::async_http_client,
+    AuthenticationFlow, AuthorizationCode, CsrfToken, Nonce, Scope, TokenResponse,
+};
 use retainer::Cache;
 use rs_utils::{convert_naive_to_utc, get_first_and_last_day_of_month, IsFeatureEnabled};
 use rust_decimal::{
@@ -42,7 +47,7 @@ use sea_orm::{
 };
 use sea_query::{
     extension::postgres::PgExpr, Alias, Asterisk, Cond, Condition, Expr, Func, NullOrdering,
-    PostgresQueryBuilder, Query, SelectStatement,
+    PgFunc, PostgresQueryBuilder, Query, SelectStatement,
 };
 use serde::{Deserialize, Serialize};
 use struson::writer::{JsonStreamWriter, JsonWriter};
@@ -77,20 +82,20 @@ use crate::{
         media::{
             AnimeSpecifics, AudioBookSpecifics, BookSpecifics, CommitMediaInput, CommitPersonInput,
             CreateOrUpdateCollectionInput, GenreListItem, ImportOrExportItemRating,
-            ImportOrExportItemReview, ImportOrExportItemReviewComment, ImportOrExportMediaItem,
-            ImportOrExportMediaItemSeen, ImportOrExportPersonItem, MangaSpecifics,
-            MediaCreatorSearchItem, MediaDetails, MediaListItem, MetadataFreeCreator,
-            MetadataGroupListItem, MetadataGroupSearchItem, MetadataImage,
-            MetadataImageForMediaDetails, MetadataImageLot, MetadataSearchItem,
+            ImportOrExportItemReview, ImportOrExportItemReviewComment,
+            ImportOrExportMediaGroupItem, ImportOrExportMediaItem, ImportOrExportMediaItemSeen,
+            ImportOrExportPersonItem, MangaSpecifics, MediaCreatorSearchItem, MediaDetails,
+            MediaListItem, MetadataFreeCreator, MetadataGroupListItem, MetadataGroupSearchItem,
+            MetadataImage, MetadataImageForMediaDetails, MetadataImageLot, MetadataSearchItem,
             MetadataSearchItemResponse, MetadataSearchItemWithLot, MetadataVideo,
             MetadataVideoSource, MovieSpecifics, PartialMetadata, PartialMetadataPerson,
             PartialMetadataWithoutId, PeopleSearchItem, PersonSourceSpecifics, PodcastSpecifics,
             PostReviewInput, ProgressUpdateError, ProgressUpdateErrorVariant, ProgressUpdateInput,
             ProgressUpdateResultUnion, PublicCollectionItem, ReviewPostedEvent,
             SeenAnimeExtraInformation, SeenMangaExtraInformation, SeenPodcastExtraInformation,
-            SeenShowExtraInformation, ShowSpecifics, ToggleMediaMonitorInput, UserMediaOwnership,
-            UserMediaReminder, UserSummary, UserToMediaReason, VideoGameSpecifics,
-            VisualNovelSpecifics, WatchProvider,
+            SeenShowExtraInformation, ShowSpecifics, UserMediaOwnership, UserMediaReminder,
+            UserSummary, UserToMediaReason, VideoGameSpecifics, VisualNovelSpecifics,
+            WatchProvider,
         },
         BackgroundJob, ChangeCollectionToEntityInput, EntityLot, IdAndNamedObject, IdObject,
         MediaStateChanged, SearchDetails, SearchInput, SearchResults, StoredUrl,
@@ -122,8 +127,8 @@ use crate::{
     },
     utils::{
         add_entity_to_collection, associate_user_with_entity, entity_in_collections,
-        get_current_date, get_stored_asset, get_user_to_entity_association, partial_user_by_id,
-        user_by_id, user_id_from_token, AUTHOR,
+        get_current_date, get_stored_asset, get_user_to_entity_association, ilike_sql,
+        partial_user_by_id, user_by_id, user_id_from_token, AUTHOR,
     },
 };
 
@@ -226,16 +231,29 @@ enum UserDetailsResult {
     Error(UserDetailsError),
 }
 
-#[derive(Debug, InputObject)]
-struct UserInput {
+#[derive(Debug, InputObject, Serialize, Deserialize, Clone)]
+struct PasswordUserInput {
     username: String,
     #[graphql(secret)]
     password: String,
 }
 
+#[derive(Debug, InputObject, Serialize, Deserialize, Clone)]
+struct OidcUserInput {
+    email: String,
+    #[graphql(secret)]
+    issuer_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, OneofObject, Clone)]
+enum AuthUserInput {
+    Password(PasswordUserInput),
+    Oidc(OidcUserInput),
+}
+
 #[derive(Enum, Clone, Debug, Copy, PartialEq, Eq)]
 enum RegisterErrorVariant {
-    UsernameAlreadyExists,
+    IdentifierAlreadyExists,
     Disabled,
 }
 
@@ -254,6 +272,7 @@ enum RegisterResult {
 enum LoginErrorVariant {
     UsernameDoesNotExist,
     CredentialsMismatch,
+    IncorrectProviderChosen,
 }
 
 #[derive(Debug, SimpleObject)]
@@ -275,7 +294,6 @@ enum LoginResult {
 #[derive(Debug, InputObject)]
 struct UpdateUserInput {
     username: Option<String>,
-    email: Option<String>,
     #[graphql(secret)]
     password: Option<String>,
 }
@@ -520,7 +538,6 @@ enum MediaGeneralFilter {
     OnAHold,
     Completed,
     Unseen,
-    ExplicitlyMonitored,
     Owned,
 }
 
@@ -556,10 +573,10 @@ struct CoreDetails {
     author_name: String,
     repository_link: String,
     item_details_height: u32,
-    reviews_disabled: bool,
     page_limit: i32,
     timezone: String,
     token_valid_for_days: i64,
+    oidc_enabled: bool,
 }
 
 #[derive(Debug, Ord, PartialEq, Eq, PartialOrd, Clone)]
@@ -578,7 +595,6 @@ struct UserPersonDetails {
     reviews: Vec<ReviewItem>,
     collections: Vec<collection::Model>,
     reminder: Option<UserMediaReminder>,
-    is_monitored: Option<bool>,
 }
 
 #[derive(SimpleObject)]
@@ -586,7 +602,6 @@ struct UserMetadataGroupDetails {
     reviews: Vec<ReviewItem>,
     collections: Vec<collection::Model>,
     reminder: Option<UserMediaReminder>,
-    is_monitored: Option<bool>,
     ownership: Option<UserMediaOwnership>,
 }
 
@@ -602,8 +617,6 @@ struct UserMediaDetails {
     in_progress: Option<seen::Model>,
     /// The next episode/chapter of this media.
     next_entry: Option<UserMediaNextEntry>,
-    /// Whether the user is monitoring this media.
-    is_monitored: bool,
     /// The reminder that the user has set for this media.
     reminder: Option<UserMediaReminder>,
     /// The number of users who have seen this media.
@@ -683,9 +696,9 @@ struct GraphqlCalendarEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize, SimpleObject, Clone, Default)]
-struct GroupedCalendarEvent {
-    events: Vec<GraphqlCalendarEvent>,
-    date: NaiveDate,
+struct OidcTokenOutput {
+    subject: String,
+    email: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, InputObject, Clone, Default)]
@@ -729,12 +742,50 @@ struct MetadataSearchInput {
     source: MediaSource,
 }
 
+#[derive(Debug, Serialize, Deserialize, SimpleObject, Clone, Default)]
+struct GroupedCalendarEvent {
+    events: Vec<GraphqlCalendarEvent>,
+    date: NaiveDate,
+}
+
 fn get_password_hasher() -> Argon2<'static> {
     Argon2::default()
 }
 
 fn get_id_hasher(salt: &str) -> Harsh {
     Harsh::builder().length(10).salt(salt).build().unwrap()
+}
+
+fn get_review_export_item(rev: ReviewItem) -> ImportOrExportItemRating {
+    let (show_season_number, show_episode_number) = match rev.show_extra_information {
+        Some(d) => (Some(d.season), Some(d.episode)),
+        None => (None, None),
+    };
+    let podcast_episode_number = rev.podcast_extra_information.map(|d| d.episode);
+    let anime_episode_number = rev.anime_extra_information.and_then(|d| d.episode);
+    let manga_chapter_number = rev.manga_extra_information.and_then(|d| d.chapter);
+    ImportOrExportItemRating {
+        review: Some(ImportOrExportItemReview {
+            visibility: Some(rev.visibility),
+            date: Some(rev.posted_on),
+            spoiler: Some(rev.spoiler),
+            text: rev.text_original,
+        }),
+        rating: rev.rating,
+        show_season_number,
+        show_episode_number,
+        podcast_episode_number,
+        anime_episode_number,
+        manga_chapter_number,
+        comments: match rev.comments.is_empty() {
+            true => None,
+            false => Some(rev.comments),
+        },
+    }
+}
+
+fn empty_nonce_verifier(_nonce: Option<&Nonce>) -> Result<(), String> {
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1018,6 +1069,18 @@ impl MiscellaneousQuery {
         let user_id = service.user_id_from_ctx(gql_ctx).await?;
         service.metadata_group_search(user_id, input).await
     }
+
+    /// Get an authorization URL using the configured OIDC client.
+    async fn get_oidc_redirect_url(&self, gql_ctx: &Context<'_>) -> Result<String> {
+        let service = gql_ctx.data_unchecked::<Arc<MiscellaneousService>>();
+        service.get_oidc_redirect_url().await
+    }
+
+    /// Get an access token using the configured OIDC client.
+    async fn get_oidc_token(&self, gql_ctx: &Context<'_>, code: String) -> Result<OidcTokenOutput> {
+        let service = gql_ctx.data_unchecked::<Arc<MiscellaneousService>>();
+        service.get_oidc_token(code).await
+    }
 }
 
 #[derive(Default)]
@@ -1182,18 +1245,16 @@ impl MiscellaneousMutation {
     async fn register_user(
         &self,
         gql_ctx: &Context<'_>,
-        input: UserInput,
+        input: AuthUserInput,
     ) -> Result<RegisterResult> {
         let service = gql_ctx.data_unchecked::<Arc<MiscellaneousService>>();
-        service
-            .register_user(&input.username, &input.password)
-            .await
+        service.register_user(input).await
     }
 
     /// Login a user using their username and password and return an auth token.
-    async fn login_user(&self, gql_ctx: &Context<'_>, input: UserInput) -> Result<LoginResult> {
+    async fn login_user(&self, gql_ctx: &Context<'_>, input: AuthUserInput) -> Result<LoginResult> {
         let service = gql_ctx.data_unchecked::<Arc<MiscellaneousService>>();
-        service.login_user(&input.username, &input.password).await
+        service.login_user(input).await
     }
 
     /// Update a user's profile details.
@@ -1291,17 +1352,6 @@ impl MiscellaneousMutation {
         let user_id = service.user_id_from_ctx(gql_ctx).await?;
         service.admin_account_guard(user_id).await?;
         service.delete_user(to_delete_user_id).await
-    }
-
-    /// Toggle the monitor on a media for a user.
-    async fn toggle_media_monitor(
-        &self,
-        gql_ctx: &Context<'_>,
-        input: ToggleMediaMonitorInput,
-    ) -> Result<bool> {
-        let service = gql_ctx.data_unchecked::<Arc<MiscellaneousService>>();
-        let user_id = service.user_id_from_ctx(gql_ctx).await?;
-        service.toggle_media_monitor(user_id, input).await
     }
 
     /// Create or update a reminder on a media for a user.
@@ -1415,6 +1465,7 @@ pub struct MiscellaneousService {
     file_storage_service: Arc<FileStorageService>,
     seen_progress_cache: Arc<Cache<ProgressUpdateCache, ()>>,
     config: Arc<config::AppConfig>,
+    oidc_client: Arc<Option<CoreClient>>,
 }
 
 impl AuthProvider for MiscellaneousService {}
@@ -1427,19 +1478,13 @@ impl MiscellaneousService {
         perform_application_job: &SqliteStorage<ApplicationJob>,
         perform_core_application_job: &SqliteStorage<CoreApplicationJob>,
         timezone: Arc<chrono_tz::Tz>,
+        oidc_client: Arc<Option<CoreClient>>,
     ) -> Self {
         let seen_progress_cache = Arc::new(Cache::new());
-        let cache_clone = seen_progress_cache.clone();
+        let seen_progress_cache_clone = seen_progress_cache.clone();
 
-        tokio::spawn(async move {
-            cache_clone
-                .monitor(
-                    4,
-                    0.25,
-                    ChronoDuration::try_minutes(3).unwrap().to_std().unwrap(),
-                )
-                .await
-        });
+        let frequency = ChronoDuration::try_minutes(3).unwrap().to_std().unwrap();
+        tokio::spawn(async move { seen_progress_cache_clone.monitor(4, 0.25, frequency).await });
 
         Self {
             db: db.clone(),
@@ -1449,37 +1494,12 @@ impl MiscellaneousService {
             seen_progress_cache,
             perform_application_job: perform_application_job.clone(),
             perform_core_application_job: perform_core_application_job.clone(),
+            oidc_client,
         }
     }
 }
 
-fn get_review_export_item(rev: ReviewItem) -> ImportOrExportItemRating {
-    let (show_season_number, show_episode_number) = match rev.show_extra_information {
-        Some(d) => (Some(d.season), Some(d.episode)),
-        None => (None, None),
-    };
-    let podcast_episode_number = rev.podcast_extra_information.map(|d| d.episode);
-    let anime_episode_number = rev.anime_extra_information.and_then(|d| d.episode);
-    let manga_chapter_number = rev.manga_extra_information.and_then(|d| d.chapter);
-    ImportOrExportItemRating {
-        review: Some(ImportOrExportItemReview {
-            visibility: Some(rev.visibility),
-            date: Some(rev.posted_on),
-            spoiler: Some(rev.spoiler),
-            text: rev.text_original,
-        }),
-        rating: rev.rating,
-        show_season_number,
-        show_episode_number,
-        podcast_episode_number,
-        anime_episode_number,
-        manga_chapter_number,
-        comments: match rev.comments.is_empty() {
-            true => None,
-            false => Some(rev.comments),
-        },
-    }
-}
+type EntityToMonitoredByMap = HashMap<i32, Vec<i32>>;
 
 impl MiscellaneousService {
     async fn core_details(&self) -> Result<CoreDetails> {
@@ -1489,9 +1509,9 @@ impl MiscellaneousService {
             docs_link: "https://ignisda.github.io/ryot".to_owned(),
             repository_link: "https://github.com/ignisda/ryot".to_owned(),
             page_limit: self.config.frontend.page_size,
-            reviews_disabled: self.config.users.reviews_disabled,
             item_details_height: self.config.frontend.item_details_height,
             token_valid_for_days: self.config.users.token_valid_for_days,
+            oidc_enabled: self.oidc_client.is_some(),
         })
     }
 
@@ -1830,9 +1850,6 @@ impl MiscellaneousService {
                 None
             }
         });
-        let is_monitored = self
-            .get_metadata_monitored_status(user_id, metadata_id)
-            .await?;
         let metadata_alias = Alias::new("m");
         let seen_alias = Alias::new("s");
         let seen_select = Query::select()
@@ -1887,7 +1904,6 @@ impl MiscellaneousService {
             history,
             in_progress,
             next_entry: next_episode,
-            is_monitored,
             seen_by,
             reminder,
             average_rating,
@@ -1912,7 +1928,6 @@ impl MiscellaneousService {
         Ok(UserPersonDetails {
             reviews,
             collections,
-            is_monitored: association.clone().and_then(|n| n.media_monitored),
             reminder: association.and_then(|n| n.media_reminder),
         })
     }
@@ -1940,7 +1955,6 @@ impl MiscellaneousService {
         Ok(UserMetadataGroupDetails {
             reviews,
             collections,
-            is_monitored: association.clone().and_then(|n| n.media_monitored),
             ownership: association.clone().and_then(|n| n.media_ownership),
             reminder: association.and_then(|n| n.media_reminder),
         })
@@ -1999,9 +2013,9 @@ impl MiscellaneousService {
                     .to(calendar_event::Column::MetadataId)
                     .on_condition(move |left, _right| {
                         Condition::all().add_option(match only_monitored {
-                            true => Some(
-                                Expr::col((left, user_to_entity::Column::MediaMonitored)).eq(true),
-                            ),
+                            true => Some(Expr::val(DefaultCollection::Monitoring.to_string()).eq(
+                                PgFunc::any(Expr::col((left, user_to_entity::Column::MediaReason))),
+                            )),
                             false => None,
                         })
                     })
@@ -2125,13 +2139,6 @@ impl MiscellaneousService {
             .filter(user_to_entity::Column::MetadataId.is_not_null())
             .apply_if(
                 match input.filter.as_ref().and_then(|f| f.general) {
-                    Some(MediaGeneralFilter::ExplicitlyMonitored) => Some(true),
-                    _ => None,
-                },
-                |query, v| query.filter(user_to_entity::Column::MediaMonitored.eq(v)),
-            )
-            .apply_if(
-                match input.filter.as_ref().and_then(|f| f.general) {
                     Some(MediaGeneralFilter::Owned) => Some(true),
                     _ => None,
                 },
@@ -2165,7 +2172,7 @@ impl MiscellaneousService {
                     Expr::col((metadata_alias.clone(), col)),
                     Alias::new("text"),
                 ))
-                .ilike(&v)
+                .ilike(ilike_sql(&v))
             };
             main_select = main_select
                 .cond_where(
@@ -2319,7 +2326,6 @@ impl MiscellaneousService {
                 match s {
                     MediaGeneralFilter::All => {}
                     MediaGeneralFilter::Owned => {}
-                    MediaGeneralFilter::ExplicitlyMonitored => {}
                     MediaGeneralFilter::Rated => {
                         main_select = main_select
                             .and_where(
@@ -2774,13 +2780,16 @@ impl MiscellaneousService {
             .await
             .unwrap();
         for user_id in all_users {
-            let collection_ids: Vec<i32> = Collection::find()
-                .select_only()
+            let collections = Collection::find()
                 .column(collection::Column::Id)
                 .filter(collection::Column::UserId.eq(user_id))
-                .into_tuple()
                 .all(&self.db)
                 .await
+                .unwrap();
+            let monitoring_collection_id = collections
+                .iter()
+                .find(|c| c.name == DefaultCollection::Monitoring.to_string())
+                .map(|c| c.id)
                 .unwrap();
             let all_user_to_metadata = UserToEntity::find()
                 .filter(user_to_entity::Column::MetadataId.is_not_null())
@@ -2805,24 +2814,21 @@ impl MiscellaneousService {
                     .await
                     .unwrap();
                 // check if it is part of any collection
-                let meta_ids: Vec<i32> = CollectionToEntity::find()
+                let collections_part_of = CollectionToEntity::find()
                     .select_only()
-                    .column(collection_to_entity::Column::MetadataId)
-                    .filter(
-                        collection_to_entity::Column::CollectionId.is_in(collection_ids.clone()),
-                    )
-                    .filter(collection_to_entity::Column::MetadataId.is_not_null())
-                    .into_tuple()
+                    .column(collection_to_entity::Column::CollectionId)
+                    .filter(collection_to_entity::Column::MetadataId.eq(u.metadata_id.unwrap()))
+                    .filter(collection_to_entity::Column::CollectionId.is_not_null())
+                    .into_tuple::<i32>()
                     .all(&self.db)
                     .await
                     .unwrap();
-                let is_in_collection = meta_ids.contains(&u.metadata_id.unwrap());
-                let is_monitored = u.media_monitored.unwrap_or_default();
+                let is_in_collection = !collections_part_of.is_empty();
+                let is_monitoring = collections_part_of.contains(&monitoring_collection_id);
                 let is_reminder_active = u.media_reminder.is_some();
                 let is_owned = u.media_ownership.is_some();
                 if seen_count + reviewed_count == 0
                     && !is_in_collection
-                    && !is_monitored
                     && !is_reminder_active
                     && !is_owned
                 {
@@ -2830,7 +2836,7 @@ impl MiscellaneousService {
                         "Removing user_to_metadata = {id:?}",
                         id = (u.user_id, u.metadata_id)
                     );
-                    u.delete(&self.db).await.ok();
+                    u.delete(&self.db).await.unwrap();
                 } else {
                     let mut new_reasons = HashSet::new();
                     if seen_count > 0 {
@@ -2842,14 +2848,14 @@ impl MiscellaneousService {
                     if is_in_collection {
                         new_reasons.insert(UserToMediaReason::Collection);
                     }
-                    if is_monitored {
-                        new_reasons.insert(UserToMediaReason::Monitored);
-                    }
                     if is_reminder_active {
                         new_reasons.insert(UserToMediaReason::Reminder);
                     }
                     if is_owned {
                         new_reasons.insert(UserToMediaReason::Owned);
+                    }
+                    if is_monitoring {
+                        new_reasons.insert(UserToMediaReason::Monitoring);
                     }
                     let previous_reasons =
                         HashSet::from_iter(u.media_reason.clone().unwrap_or_default().into_iter());
@@ -2862,7 +2868,7 @@ impl MiscellaneousService {
                         u.media_reason = ActiveValue::Set(Some(new_reasons.into_iter().collect()));
                     }
                     u.needs_to_be_updated = ActiveValue::Set(None);
-                    u.update(&self.db).await.ok();
+                    u.update(&self.db).await.unwrap();
                 }
             }
             let all_user_to_person = UserToEntity::find()
@@ -2881,27 +2887,24 @@ impl MiscellaneousService {
                     .await
                     .unwrap();
                 // check if it is part of any collection
-                let person_ids: Vec<i32> = CollectionToEntity::find()
+                let collections_part_of = CollectionToEntity::find()
                     .select_only()
-                    .column(collection_to_entity::Column::PersonId)
-                    .filter(
-                        collection_to_entity::Column::CollectionId.is_in(collection_ids.clone()),
-                    )
-                    .filter(collection_to_entity::Column::PersonId.is_not_null())
-                    .into_tuple()
+                    .column(collection_to_entity::Column::CollectionId)
+                    .filter(collection_to_entity::Column::MetadataId.eq(u.metadata_id.unwrap()))
+                    .filter(collection_to_entity::Column::CollectionId.is_not_null())
+                    .into_tuple::<i32>()
                     .all(&self.db)
                     .await
                     .unwrap();
-                let is_in_collection = person_ids.contains(&u.person_id.unwrap());
-                let is_monitored = u.media_monitored.unwrap_or_default();
+                let is_in_collection = !collections_part_of.is_empty();
+                let is_monitoring = collections_part_of.contains(&monitoring_collection_id);
                 let is_reminder_active = u.media_reminder.is_some();
-                if reviewed_count == 0 && !is_in_collection && !is_monitored && !is_reminder_active
-                {
+                if reviewed_count == 0 && !is_in_collection && !is_reminder_active {
                     tracing::debug!(
                         "Removing user_to_person = {id:?}",
                         id = (u.user_id, u.person_id)
                     );
-                    u.delete(&self.db).await.ok();
+                    u.delete(&self.db).await.unwrap();
                 } else {
                     let mut new_reasons = HashSet::new();
                     if reviewed_count > 0 {
@@ -2910,11 +2913,11 @@ impl MiscellaneousService {
                     if is_in_collection {
                         new_reasons.insert(UserToMediaReason::Collection);
                     }
-                    if is_monitored {
-                        new_reasons.insert(UserToMediaReason::Monitored);
-                    }
                     if is_reminder_active {
                         new_reasons.insert(UserToMediaReason::Reminder);
+                    }
+                    if is_monitoring {
+                        new_reasons.insert(UserToMediaReason::Monitoring);
                     }
                     let previous_reasons =
                         HashSet::from_iter(u.media_reason.clone().unwrap_or_default().into_iter());
@@ -2927,7 +2930,7 @@ impl MiscellaneousService {
                         u.media_reason = ActiveValue::Set(Some(new_reasons.into_iter().collect()));
                     }
                     u.needs_to_be_updated = ActiveValue::Set(None);
-                    u.update(&self.db).await.ok();
+                    u.update(&self.db).await.unwrap();
                 }
             }
             let all_user_to_metadata_groups = UserToEntity::find()
@@ -2946,32 +2949,28 @@ impl MiscellaneousService {
                     .await
                     .unwrap();
                 // check if it is part of any collection
-                let metadata_group_ids: Vec<i32> = CollectionToEntity::find()
+                let collections_part_of = CollectionToEntity::find()
                     .select_only()
-                    .column(collection_to_entity::Column::MetadataGroupId)
+                    .column(collection_to_entity::Column::CollectionId)
                     .filter(
-                        collection_to_entity::Column::CollectionId.is_in(collection_ids.clone()),
+                        collection_to_entity::Column::MetadataGroupId
+                            .eq(u.metadata_group_id.unwrap()),
                     )
-                    .filter(collection_to_entity::Column::MetadataGroupId.is_not_null())
-                    .into_tuple()
+                    .filter(collection_to_entity::Column::CollectionId.is_not_null())
+                    .into_tuple::<i32>()
                     .all(&self.db)
                     .await
                     .unwrap();
-                let is_in_collection = metadata_group_ids.contains(&u.metadata_group_id.unwrap());
-                let is_monitored = u.media_monitored.unwrap_or_default();
+                let is_in_collection = !collections_part_of.is_empty();
+                let is_monitoring = collections_part_of.contains(&monitoring_collection_id);
                 let is_owned = u.media_ownership.is_some();
                 let is_reminder_active = u.media_reminder.is_some();
-                if reviewed_count == 0
-                    && !is_in_collection
-                    && !is_monitored
-                    && !is_reminder_active
-                    && !is_owned
-                {
+                if reviewed_count == 0 && !is_in_collection && !is_reminder_active && !is_owned {
                     tracing::debug!(
                         "Removing user_to_metadata_group = {id:?}",
                         id = (u.user_id, u.metadata_group_id)
                     );
-                    u.delete(&self.db).await.ok();
+                    u.delete(&self.db).await.unwrap();
                 } else {
                     let mut new_reasons = HashSet::new();
                     if reviewed_count > 0 {
@@ -2980,14 +2979,14 @@ impl MiscellaneousService {
                     if is_in_collection {
                         new_reasons.insert(UserToMediaReason::Collection);
                     }
-                    if is_monitored {
-                        new_reasons.insert(UserToMediaReason::Monitored);
-                    }
                     if is_reminder_active {
                         new_reasons.insert(UserToMediaReason::Reminder);
                     }
                     if is_owned {
                         new_reasons.insert(UserToMediaReason::Owned);
+                    }
+                    if is_monitoring {
+                        new_reasons.insert(UserToMediaReason::Monitoring);
                     }
                     let previous_reasons =
                         HashSet::from_iter(u.media_reason.clone().unwrap_or_default().into_iter());
@@ -3000,7 +2999,7 @@ impl MiscellaneousService {
                         u.media_reason = ActiveValue::Set(Some(new_reasons.into_iter().collect()));
                     }
                     u.needs_to_be_updated = ActiveValue::Set(None);
-                    u.update(&self.db).await.ok();
+                    u.update(&self.db).await.unwrap();
                 }
             }
         }
@@ -3260,7 +3259,7 @@ impl MiscellaneousService {
         Ok(())
     }
 
-    async fn commit_metadata_group_internal(
+    pub async fn commit_metadata_group_internal(
         &self,
         identifier: &String,
         lot: MediaLot,
@@ -3603,9 +3602,6 @@ impl MiscellaneousService {
             .await
             .unwrap();
             let mut cloned: user_to_entity::ActiveModel = old_association.clone().into();
-            if old_association.media_monitored.is_none() {
-                cloned.media_monitored = ActiveValue::Set(association.media_monitored);
-            }
             if old_association.media_reminder.is_none() {
                 cloned.media_reminder = ActiveValue::Set(association.media_reminder);
             }
@@ -3913,6 +3909,14 @@ impl MiscellaneousService {
         Ok(service)
     }
 
+    pub async fn get_tmdb_non_media_service(&self) -> Result<NonMediaTmdbService> {
+        Ok(NonMediaTmdbService::new(
+            self.config.movies_and_shows.tmdb.access_token.clone(),
+            self.config.movies_and_shows.tmdb.locale.clone(),
+        )
+        .await)
+    }
+
     async fn get_non_metadata_provider(&self, source: MediaSource) -> Result<Provider> {
         let err = || Err(Error::new("This source is not supported".to_owned()));
         let service: Provider = match source {
@@ -3952,13 +3956,7 @@ impl MiscellaneousService {
                 )
                 .await,
             ),
-            MediaSource::Tmdb => Box::new(
-                NonMediaTmdbService::new(
-                    self.config.movies_and_shows.tmdb.access_token.clone(),
-                    self.config.movies_and_shows.tmdb.locale.clone(),
-                )
-                .await,
-            ),
+            MediaSource::Tmdb => Box::new(self.get_tmdb_non_media_service().await?),
             MediaSource::Anilist => {
                 Box::new(NonMediaAnilistService::new(self.config.frontend.page_size).await)
             }
@@ -4185,9 +4183,13 @@ impl MiscellaneousService {
             .apply_if(input.query, |query, v| {
                 query.filter(
                     Condition::any()
-                        .add(Expr::col((c_alias.clone(), collection::Column::Name)).ilike(&v))
                         .add(
-                            Expr::col((c_alias.clone(), collection::Column::Description)).ilike(&v),
+                            Expr::col((c_alias.clone(), collection::Column::Name))
+                                .ilike(ilike_sql(&v)),
+                        )
+                        .add(
+                            Expr::col((c_alias.clone(), collection::Column::Description))
+                                .ilike(ilike_sql(&v)),
                         ),
                 )
             })
@@ -4226,11 +4228,14 @@ impl MiscellaneousService {
         let sort = input.sort.unwrap_or_default();
         let filter = input.filter.unwrap_or_default();
         let page: u64 = search.page.unwrap_or(1).try_into().unwrap();
-        let collection = Collection::find_by_id(input.collection_id)
+        let maybe_collection = Collection::find_by_id(input.collection_id)
             .one(&self.db)
             .await
-            .unwrap()
             .unwrap();
+        let collection = match maybe_collection {
+            Some(c) => c,
+            None => return Err(Error::new("Collection not found".to_owned())),
+        };
         if collection.visibility != Visibility::Public {
             match user_id {
                 None => {
@@ -4261,18 +4266,22 @@ impl MiscellaneousService {
                         Condition::any()
                             .add(
                                 Expr::col((AliasedMetadata::Table, metadata::Column::Title))
-                                    .ilike(&v),
+                                    .ilike(ilike_sql(&v)),
                             )
                             .add(
                                 Expr::col((
                                     AliasedMetadataGroup::Table,
                                     metadata_group::Column::Title,
                                 ))
-                                .ilike(&v),
+                                .ilike(ilike_sql(&v)),
                             )
-                            .add(Expr::col((AliasedPerson::Table, person::Column::Name)).ilike(&v))
                             .add(
-                                Expr::col((AliasedExercise::Table, exercise::Column::Id)).ilike(&v),
+                                Expr::col((AliasedPerson::Table, person::Column::Name))
+                                    .ilike(ilike_sql(&v)),
+                            )
+                            .add(
+                                Expr::col((AliasedExercise::Table, exercise::Column::Id))
+                                    .ilike(ilike_sql(&v)),
                             ),
                     )
                 })
@@ -4419,8 +4428,11 @@ impl MiscellaneousService {
     }
 
     pub async fn post_review(&self, user_id: i32, input: PostReviewInput) -> Result<IdObject> {
-        if self.config.users.reviews_disabled {
-            return Err(Error::new("Posting reviews on this instance is disabled"));
+        let preferences = partial_user_by_id::<UserWithOnlyPreferences>(&self.db, user_id)
+            .await?
+            .preferences;
+        if preferences.general.disable_reviews {
+            return Err(Error::new("Reviews are disabled"));
         }
         let review_id = match input.review_id {
             Some(i) => ActiveValue::Set(i),
@@ -4449,9 +4461,6 @@ impl MiscellaneousService {
         if input.rating.is_none() && input.text.is_none() {
             return Err(Error::new("At-least one of rating or review is required."));
         }
-        let preferences = partial_user_by_id::<UserWithOnlyPreferences>(&self.db, user_id)
-            .await?
-            .preferences;
         let mut review_obj = review::ActiveModel {
             id: review_id,
             rating: ActiveValue::Set(input.rating.map(
@@ -4552,6 +4561,15 @@ impl MiscellaneousService {
         match review {
             Some(r) => {
                 if r.user_id == user_id {
+                    associate_user_with_entity(
+                        &user_id,
+                        r.metadata_id,
+                        r.person_id,
+                        None,
+                        r.metadata_group_id,
+                        &self.db,
+                    )
+                    .await?;
                     r.delete(&self.db).await?;
                     Ok(true)
                 } else {
@@ -4658,11 +4676,20 @@ impl MiscellaneousService {
                 collection_to_entity::Column::MetadataId
                     .eq(input.metadata_id)
                     .or(collection_to_entity::Column::PersonId.eq(input.person_id))
-                    .or(collection_to_entity::Column::MetadataGroupId.eq(input.media_group_id))
-                    .or(collection_to_entity::Column::ExerciseId.eq(input.exercise_id)),
+                    .or(collection_to_entity::Column::MetadataGroupId.eq(input.metadata_group_id))
+                    .or(collection_to_entity::Column::ExerciseId.eq(input.exercise_id.clone())),
             )
             .exec(&self.db)
             .await?;
+        associate_user_with_entity(
+            &user_id,
+            input.metadata_id,
+            input.person_id,
+            input.exercise_id,
+            input.metadata_group_id,
+            &self.db,
+        )
+        .await?;
         Ok(IdObject { id: collect.id })
     }
 
@@ -4707,6 +4734,8 @@ impl MiscellaneousService {
                 .await
                 .ok();
             }
+            associate_user_with_entity(&user_id, Some(metadata_id), None, None, None, &self.db)
+                .await?;
             Ok(IdObject { id: seen_id })
         } else {
             Err(Error::new("This seen item does not exist".to_owned()))
@@ -4737,13 +4766,8 @@ impl MiscellaneousService {
     pub async fn update_metadata_and_notify_users(&self, metadata_id: i32) -> Result<()> {
         let notifications = self.update_metadata(metadata_id).await.unwrap();
         if !notifications.is_empty() {
-            let users_to_notify = self
-                .users_to_be_notified_for_metadata_state_changes()
-                .await
-                .unwrap()
-                .get(&metadata_id)
-                .cloned()
-                .unwrap_or_default();
+            let (meta_map, _, _) = self.get_entities_monitored_by().await.unwrap();
+            let users_to_notify = meta_map.get(&metadata_id).cloned().unwrap_or_default();
             for notification in notifications {
                 for user_id in users_to_notify.iter() {
                     self.send_media_state_changed_notification_for_user(
@@ -5070,22 +5094,32 @@ impl MiscellaneousService {
         Ok(IdObject { id: obj.id })
     }
 
-    async fn register_user(&self, username: &str, password: &str) -> Result<RegisterResult> {
+    async fn register_user(&self, input: AuthUserInput) -> Result<RegisterResult> {
         if !self.config.users.allow_registration {
             return Ok(RegisterResult::Error(RegisterError {
                 error: RegisterErrorVariant::Disabled,
             }));
         }
-        if User::find()
-            .filter(user::Column::Name.eq(username))
-            .count(&self.db)
-            .await
-            .unwrap()
-            != 0
-        {
+        let (filter, username, password) = match input.clone() {
+            AuthUserInput::Oidc(input) => (
+                user::Column::OidcIssuerId.eq(&input.issuer_id),
+                input.email,
+                None,
+            ),
+            AuthUserInput::Password(input) => (
+                user::Column::Name.eq(&input.username),
+                input.username,
+                Some(input.password),
+            ),
+        };
+        if User::find().filter(filter).count(&self.db).await.unwrap() != 0 {
             return Ok(RegisterResult::Error(RegisterError {
-                error: RegisterErrorVariant::UsernameAlreadyExists,
+                error: RegisterErrorVariant::IdentifierAlreadyExists,
             }));
+        };
+        let oidc_issuer_id = match input {
+            AuthUserInput::Oidc(input) => Some(input.issuer_id),
+            AuthUserInput::Password(_) => None,
         };
         let lot = if User::find().count(&self.db).await.unwrap() == 0 {
             UserLot::Admin
@@ -5093,8 +5127,9 @@ impl MiscellaneousService {
             UserLot::Normal
         };
         let user = user::ActiveModel {
-            name: ActiveValue::Set(username.to_owned()),
-            password: ActiveValue::Set(password.to_owned()),
+            name: ActiveValue::Set(username),
+            password: ActiveValue::Set(password),
+            oidc_issuer_id: ActiveValue::Set(oidc_issuer_id),
             lot: ActiveValue::Set(lot),
             preferences: ActiveValue::Set(UserPreferences::default()),
             sink_integrations: ActiveValue::Set(vec![]),
@@ -5107,35 +5142,43 @@ impl MiscellaneousService {
         Ok(RegisterResult::Ok(IdObject { id: user.id }))
     }
 
-    async fn login_user(&self, username: &str, password: &str) -> Result<LoginResult> {
-        let user = User::find()
-            .filter(user::Column::Name.eq(username))
-            .one(&self.db)
-            .await
-            .unwrap();
-        if user.is_none() {
-            return Ok(LoginResult::Error(LoginError {
-                error: LoginErrorVariant::UsernameDoesNotExist,
-            }));
+    async fn login_user(&self, input: AuthUserInput) -> Result<LoginResult> {
+        let filter = match input.clone() {
+            AuthUserInput::Oidc(input) => user::Column::OidcIssuerId.eq(input.issuer_id),
+            AuthUserInput::Password(input) => user::Column::Name.eq(input.username),
         };
-        let user = user.unwrap();
-        if self.config.users.validate_password {
-            let parsed_hash = PasswordHash::new(&user.password).unwrap();
-            if get_password_hasher()
-                .verify_password(password.as_bytes(), &parsed_hash)
-                .is_err()
-            {
-                return Ok(LoginResult::Error(LoginError {
-                    error: LoginErrorVariant::CredentialsMismatch,
-                }));
+        match User::find().filter(filter).one(&self.db).await.unwrap() {
+            None => Ok(LoginResult::Error(LoginError {
+                error: LoginErrorVariant::UsernameDoesNotExist,
+            })),
+            Some(user) => {
+                if self.config.users.validate_password {
+                    if let AuthUserInput::Password(PasswordUserInput { password, .. }) = input {
+                        if let Some(hashed_password) = user.password {
+                            let parsed_hash = PasswordHash::new(&hashed_password).unwrap();
+                            if get_password_hasher()
+                                .verify_password(password.as_bytes(), &parsed_hash)
+                                .is_err()
+                            {
+                                return Ok(LoginResult::Error(LoginError {
+                                    error: LoginErrorVariant::CredentialsMismatch,
+                                }));
+                            }
+                        } else {
+                            return Ok(LoginResult::Error(LoginError {
+                                error: LoginErrorVariant::IncorrectProviderChosen,
+                            }));
+                        }
+                    }
+                }
+                let jwt_key = jwt::sign(
+                    user.id,
+                    &self.config.users.jwt_secret,
+                    self.config.users.token_valid_for_days,
+                )?;
+                Ok(LoginResult::Ok(LoginResponse { api_key: jwt_key }))
             }
         }
-        let jwt_key = jwt::sign(
-            user.id,
-            &self.config.users.jwt_secret,
-            self.config.users.token_valid_for_days,
-        )?;
-        Ok(LoginResult::Ok(LoginResponse { api_key: jwt_key }))
     }
 
     // this job is run when a user is created for the first time
@@ -5165,12 +5208,7 @@ impl MiscellaneousService {
         if let Some(n) = input.username {
             user_obj.name = ActiveValue::Set(n);
         }
-        if let Some(e) = input.email {
-            user_obj.email = ActiveValue::Set(Some(e));
-        }
-        if let Some(p) = input.password {
-            user_obj.password = ActiveValue::Set(p);
-        }
+        user_obj.password = ActiveValue::Set(input.password);
         let user_obj = user_obj.update(&self.db).await.unwrap();
         Ok(IdObject { id: user_obj.id })
     }
@@ -5603,6 +5641,9 @@ impl MiscellaneousService {
                         "watch_providers" => {
                             preferences.general.watch_providers =
                                 serde_json::from_str(&input.value).unwrap();
+                        }
+                        "disable_reviews" => {
+                            preferences.general.disable_reviews = value_bool.unwrap();
                         }
                         _ => return Err(err()),
                     },
@@ -6095,11 +6136,14 @@ impl MiscellaneousService {
     }
 
     async fn integration_progress_update(&self, pu: IntegrationMedia, user_id: i32) -> Result<()> {
-        let limit = Decimal::from_i32(self.config.integration.minimum_progress_limit).unwrap();
-        if pu.progress < limit {
+        let maximum_limit =
+            Decimal::from_i32(self.config.integration.maximum_progress_limit).unwrap();
+        let minimum_limit =
+            Decimal::from_i32(self.config.integration.minimum_progress_limit).unwrap();
+        if pu.progress < minimum_limit {
             return Ok(());
         }
-        let progress = if pu.progress > limit {
+        let progress = if pu.progress > maximum_limit {
             dec!(100)
         } else {
             pu.progress
@@ -6155,15 +6199,16 @@ impl MiscellaneousService {
                 )
                 .await
                 .ok();
-                self.toggle_media_monitor(
+                self.add_entity_to_collection(
                     seen.user_id,
-                    ToggleMediaMonitorInput {
+                    ChangeCollectionToEntityInput {
+                        collection_name: DefaultCollection::Monitoring.to_string(),
                         metadata_id: Some(seen.metadata_id),
-                        force_value: Some(true),
                         ..Default::default()
                     },
                 )
-                .await?;
+                .await
+                .ok();
             }
             SeenState::Dropped | SeenState::OnAHold => {
                 self.remove_entity_from_collection(
@@ -6246,15 +6291,16 @@ impl MiscellaneousService {
                         )
                         .await
                         .ok();
-                        self.toggle_media_monitor(
+                        self.add_entity_to_collection(
                             seen.user_id,
-                            ToggleMediaMonitorInput {
+                            ChangeCollectionToEntityInput {
+                                collection_name: DefaultCollection::Monitoring.to_string(),
                                 metadata_id: Some(seen.metadata_id),
-                                force_value: Some(true),
                                 ..Default::default()
                             },
                         )
-                        .await?;
+                        .await
+                        .ok();
                     }
                 } else {
                     self.remove_entity_from_collection(
@@ -6267,15 +6313,16 @@ impl MiscellaneousService {
                     )
                     .await
                     .ok();
-                    self.toggle_media_monitor(
+                    self.remove_entity_from_collection(
                         seen.user_id,
-                        ToggleMediaMonitorInput {
+                        ChangeCollectionToEntityInput {
+                            collection_name: DefaultCollection::Monitoring.to_string(),
                             metadata_id: Some(seen.metadata_id),
-                            force_value: Some(false),
                             ..Default::default()
                         },
                     )
-                    .await?;
+                    .await
+                    .ok();
                 };
             }
         };
@@ -6308,84 +6355,8 @@ impl MiscellaneousService {
         Ok(success)
     }
 
-    /// Get all the users that need to be sent notifications for metadata state change.
-    pub async fn users_to_be_notified_for_metadata_state_changes(
-        &self,
-    ) -> Result<HashMap<i32, Vec<i32>>> {
-        #[derive(Debug, FromQueryResult, Clone, Default)]
-        struct UsersToBeNotified {
-            metadata_id: i32,
-            to_notify: Vec<i32>,
-        }
-        // DEV: Ideally this should be using a materialized view, but I am too lazy.
-        let meta_map: Vec<_> =
-            UsersToBeNotified::find_by_statement(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                r#"
-SELECT
-    m.id as metadata_id,
-    array_agg(DISTINCT CASE WHEN u.id IS NOT NULL THEN u.id END) as to_notify
-FROM
-    metadata m
-LEFT JOIN user_to_entity ute ON m.id = ute.metadata_id
-LEFT JOIN "user" u ON ute.user_id = u.id
-WHERE
-    ute.media_monitored = true
-GROUP BY
-    m.id;
-        "#,
-                [],
-            ))
-            .all(&self.db)
-            .await?;
-        Ok(meta_map
-            .into_iter()
-            .filter(|m| !m.to_notify.is_empty())
-            .map(|m| (m.metadata_id, m.to_notify))
-            .collect())
-    }
-
-    // Get all the users that need to be sent notifications for person state change.
-    pub async fn users_to_be_notified_for_person_state_changes(
-        &self,
-    ) -> Result<HashMap<i32, Vec<i32>>> {
-        #[derive(Debug, FromQueryResult, Clone, Default)]
-        struct UsersToBeNotified {
-            person_id: i32,
-            to_notify: Vec<i32>,
-        }
-        // DEV: Ideally this should be using a materialized view, but I am too lazy.
-        let person_map: Vec<_> =
-            UsersToBeNotified::find_by_statement(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                r#"
-SELECT
-    p.id as person_id,
-    array_agg(DISTINCT CASE WHEN u.id IS NOT NULL THEN u.id END) as to_notify
-FROM
-    person p
-LEFT JOIN user_to_entity ute ON p.id = ute.person_id
-LEFT JOIN "user" u ON ute.user_id = u.id
-WHERE
-    ute.media_monitored = true
-GROUP BY
-    p.id;
-        "#,
-                [],
-            ))
-            .all(&self.db)
-            .await?;
-        Ok(person_map
-            .into_iter()
-            .filter(|m| !m.to_notify.is_empty())
-            .map(|m| (m.person_id, m.to_notify))
-            .collect())
-    }
-
     pub async fn update_watchlist_metadata_and_send_notifications(&self) -> Result<()> {
-        let meta_map = self
-            .users_to_be_notified_for_metadata_state_changes()
-            .await?;
+        let (meta_map, _, _) = self.get_entities_monitored_by().await?;
         tracing::debug!(
             "Users to be notified for metadata state changes: {:?}",
             meta_map
@@ -6403,12 +6374,12 @@ GROUP BY
     }
 
     pub async fn update_monitored_people_and_send_notifications(&self) -> Result<()> {
-        let meta_map = self.users_to_be_notified_for_person_state_changes().await?;
+        let (_, _, person_map) = self.get_entities_monitored_by().await?;
         tracing::debug!(
             "Users to be notified for people state changes: {:?}",
-            meta_map
+            person_map
         );
-        for (person_id, to_notify) in meta_map {
+        for (person_id, to_notify) in person_map {
             let notifications = self.update_person(person_id).await?;
             for user in to_notify {
                 for notification in notifications.iter() {
@@ -6435,51 +6406,6 @@ GROUP BY
         Ok(())
     }
 
-    pub async fn toggle_media_monitor(
-        &self,
-        user_id: i32,
-        input: ToggleMediaMonitorInput,
-    ) -> Result<bool> {
-        let metadata = associate_user_with_entity(
-            &user_id,
-            input.metadata_id,
-            input.person_id,
-            None,
-            input.metadata_group_id,
-            &self.db,
-        )
-        .await?;
-        let mut new_monitored_value = !metadata.media_monitored.unwrap_or_default();
-        if let Some(force_value) = input.force_value {
-            new_monitored_value = force_value;
-        }
-        let mut metadata: user_to_entity::ActiveModel = metadata.into();
-        metadata.media_monitored = ActiveValue::Set(Some(new_monitored_value));
-        metadata.save(&self.db).await?;
-        Ok(new_monitored_value)
-    }
-
-    async fn get_metadata_monitored_status(
-        &self,
-        user_id: i32,
-        to_monitor_metadata_id: i32,
-    ) -> Result<bool> {
-        let metadata = get_user_to_entity_association(
-            &user_id,
-            Some(to_monitor_metadata_id),
-            None,
-            None,
-            None,
-            &self.db,
-        )
-        .await;
-        Ok(if let Some(m) = metadata {
-            m.media_monitored.unwrap_or_default()
-        } else {
-            false
-        })
-    }
-
     pub async fn genres_list(&self, input: SearchInput) -> Result<SearchResults<GenreListItem>> {
         let page: u64 = input.page.unwrap_or(1).try_into().unwrap();
         let num_items = "num_items";
@@ -6492,7 +6418,9 @@ GROUP BY
                 num_items,
             )
             .apply_if(input.query, |query, v| {
-                query.filter(Condition::all().add(Expr::col(genre::Column::Name).ilike(v)))
+                query.filter(
+                    Condition::all().add(Expr::col(genre::Column::Name).ilike(ilike_sql(&v))),
+                )
             })
             .join(JoinType::Join, genre::Relation::MetadataToGenre.def())
             // fuck it. we ball. (extremely unsafe, guaranteed to fail if names change)
@@ -6531,8 +6459,10 @@ GROUP BY
         let page: u64 = input.page.unwrap_or(1).try_into().unwrap();
         let query = MetadataGroup::find()
             .apply_if(input.query, |query, v| {
-                query
-                    .filter(Condition::all().add(Expr::col(metadata_group::Column::Title).ilike(v)))
+                query.filter(
+                    Condition::all()
+                        .add(Expr::col(metadata_group::Column::Title).ilike(ilike_sql(&v))),
+                )
             })
             .filter(user_to_entity::Column::UserId.eq(user_id))
             .join(JoinType::Join, metadata_group::Relation::UserToEntity.def())
@@ -6595,7 +6525,9 @@ GROUP BY
         };
         let query = Person::find()
             .apply_if(input.search.query, |query, v| {
-                query.filter(Condition::all().add(Expr::col(person::Column::Name).ilike(v)))
+                query.filter(
+                    Condition::all().add(Expr::col(person::Column::Name).ilike(ilike_sql(&v))),
+                )
             })
             .filter(user_to_entity::Column::UserId.eq(user_id))
             .column_as(
@@ -7014,7 +6946,56 @@ GROUP BY
                 seen_history,
                 reviews,
                 collections,
-                monitored: rm.media_monitored,
+            };
+            writer.serialize_value(&exp).unwrap();
+        }
+        Ok(true)
+    }
+
+    pub async fn export_media_group(
+        &self,
+        user_id: i32,
+        writer: &mut JsonStreamWriter<File>,
+    ) -> Result<bool> {
+        let related_metadata = UserToEntity::find()
+            .filter(user_to_entity::Column::UserId.eq(user_id))
+            .filter(user_to_entity::Column::MetadataGroupId.is_not_null())
+            .all(&self.db)
+            .await
+            .unwrap();
+        for rm in related_metadata.iter() {
+            let m = rm
+                .find_related(MetadataGroup)
+                .one(&self.db)
+                .await
+                .unwrap()
+                .unwrap();
+            let db_reviews = m
+                .find_related(Review)
+                .filter(review::Column::UserId.eq(user_id))
+                .all(&self.db)
+                .await
+                .unwrap();
+            let mut reviews = vec![];
+            for review in db_reviews {
+                let review_item = get_review_export_item(
+                    self.review_by_id(review.id, user_id, false).await.unwrap(),
+                );
+                reviews.push(review_item);
+            }
+            let collections =
+                entity_in_collections(&self.db, user_id, None, None, Some(m.id), None)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.name)
+                    .collect();
+            let exp = ImportOrExportMediaGroupItem {
+                title: m.title,
+                lot: m.lot,
+                source: m.source,
+                identifier: m.identifier.clone(),
+                reviews,
+                collections,
             };
             writer.serialize_value(&exp).unwrap();
         }
@@ -7065,7 +7046,6 @@ GROUP BY
                 name: p.name,
                 reviews,
                 collections,
-                monitored: rm.media_monitored,
             };
             writer.serialize_value(&exp).unwrap();
         }
@@ -7139,14 +7119,17 @@ GROUP BY
             .await?;
 
         while let Some(meta) = meta_stream.try_next().await? {
+            tracing::trace!("Processing metadata id = {:#?}", meta.id);
             let calendar_events = meta.find_related(CalendarEvent).all(&self.db).await?;
             for cal_event in calendar_events {
                 let mut need_to_delete = false;
                 if let Some(show) = cal_event.metadata_show_extra_information {
                     if let Some(show_info) = &meta.show_specifics {
                         if let Some((_, ep)) = show_info.get_episode(show.season, show.episode) {
-                            if ep.publish_date.unwrap() != cal_event.date {
-                                need_to_delete = true;
+                            if let Some(publish_date) = ep.publish_date {
+                                if publish_date != cal_event.date {
+                                    need_to_delete = true;
+                                }
                             }
                         }
                     }
@@ -7278,9 +7261,7 @@ GROUP BY
                 )
             })
             .collect_vec();
-        let meta_map = self
-            .users_to_be_notified_for_metadata_state_changes()
-            .await?;
+        let (meta_map, _, _) = self.get_entities_monitored_by().await?;
         for (metadata_id, notification) in notifications.into_iter() {
             let users_to_notify = meta_map.get(&metadata_id).cloned().unwrap_or_default();
             for user in users_to_notify {
@@ -7351,13 +7332,8 @@ GROUP BY
     pub async fn update_person_and_notify_users(&self, person_id: i32) -> Result<()> {
         let notifications = self.update_person(person_id).await.unwrap();
         if !notifications.is_empty() {
-            let users_to_notify = self
-                .users_to_be_notified_for_person_state_changes()
-                .await
-                .unwrap()
-                .get(&person_id)
-                .cloned()
-                .unwrap_or_default();
+            let (_, _, person_map) = self.get_entities_monitored_by().await.unwrap();
+            let users_to_notify = person_map.get(&person_id).cloned().unwrap_or_default();
             for notification in notifications {
                 for user_id in users_to_notify.iter() {
                     self.send_media_state_changed_notification_for_user(
@@ -7372,19 +7348,74 @@ GROUP BY
         Ok(())
     }
 
-    pub async fn handle_review_posted_event(&self, event: ReviewPostedEvent) -> Result<()> {
-        let monitored_by = UserToEntity::find()
-            .select_only()
-            .column(user_to_entity::Column::UserId)
-            .filter(
-                user_to_entity::Column::MetadataId
-                    .eq(event.obj_id)
-                    .or(user_to_entity::Column::PersonId.eq(event.obj_id)),
+    async fn get_entities_monitored_by(
+        &self,
+    ) -> Result<(
+        EntityToMonitoredByMap,
+        EntityToMonitoredByMap,
+        EntityToMonitoredByMap,
+    )> {
+        #[derive(Debug, FromQueryResult, Clone, Default)]
+        struct UsersToBeNotified {
+            entity_id: i32,
+            to_notify: Vec<i32>,
+        }
+        let get_sql = |entity_type: &str| {
+            format!(
+                r#"
+SELECT
+    m.id as entity_id,
+    array_agg(DISTINCT u.id) as to_notify
+FROM {entity_type} m
+JOIN collection_to_entity cte ON m.id = cte.{entity_type}_id
+JOIN collection c ON cte.collection_id = c.id AND c.name = '{}'
+JOIN "user" u ON c.user_id = u.id
+GROUP BY m.id;
+        "#,
+                DefaultCollection::Monitoring
             )
-            .filter(user_to_entity::Column::MediaMonitored.eq(true))
-            .into_tuple::<i32>()
-            .all(&self.db)
-            .await?;
+        };
+        let meta_map: Vec<_> = UsersToBeNotified::find_by_statement(
+            Statement::from_sql_and_values(DbBackend::Postgres, get_sql("metadata"), []),
+        )
+        .all(&self.db)
+        .await?;
+        let meta_map = meta_map
+            .into_iter()
+            .map(|m| (m.entity_id, m.to_notify))
+            .collect::<EntityToMonitoredByMap>();
+        let meta_group_map: Vec<_> = UsersToBeNotified::find_by_statement(
+            Statement::from_sql_and_values(DbBackend::Postgres, get_sql("metadata_group"), []),
+        )
+        .all(&self.db)
+        .await?;
+        let meta_group_map = meta_group_map
+            .into_iter()
+            .map(|m| (m.entity_id, m.to_notify))
+            .collect::<EntityToMonitoredByMap>();
+        let person_map: Vec<_> = UsersToBeNotified::find_by_statement(
+            Statement::from_sql_and_values(DbBackend::Postgres, get_sql("person"), []),
+        )
+        .all(&self.db)
+        .await?;
+        let person_map = person_map
+            .into_iter()
+            .map(|m| (m.entity_id, m.to_notify))
+            .collect::<EntityToMonitoredByMap>();
+        Ok((meta_map, meta_group_map, person_map))
+    }
+
+    pub async fn handle_review_posted_event(&self, event: ReviewPostedEvent) -> Result<()> {
+        let (meta_map, meta_group_map, person_map) = self.get_entities_monitored_by().await?;
+        let monitored_by = match event.entity_lot {
+            EntityLot::Media => meta_map.get(&event.obj_id).cloned().unwrap_or_default(),
+            EntityLot::MediaGroup => meta_group_map
+                .get(&event.obj_id)
+                .cloned()
+                .unwrap_or_default(),
+            EntityLot::Person => person_map.get(&event.obj_id).cloned().unwrap_or_default(),
+            _ => vec![],
+        };
         let users = User::find()
             .select_only()
             .column(user::Column::Id)
@@ -7432,6 +7463,43 @@ GROUP BY
             url += format!("?defaultTab={}", tab).as_str()
         }
         url
+    }
+
+    async fn get_oidc_redirect_url(&self) -> Result<String> {
+        match self.oidc_client.as_ref() {
+            Some(client) => {
+                let (authorize_url, _, _) = client
+                    .authorize_url(
+                        AuthenticationFlow::<CoreResponseType>::AuthorizationCode,
+                        CsrfToken::new_random,
+                        Nonce::new_random,
+                    )
+                    .add_scope(Scope::new("email".to_string()))
+                    .url();
+                Ok(authorize_url.to_string())
+            }
+            _ => Err(Error::new("OIDC client not configured")),
+        }
+    }
+
+    async fn get_oidc_token(&self, code: String) -> Result<OidcTokenOutput> {
+        match self.oidc_client.as_ref() {
+            Some(client) => {
+                let token = client
+                    .exchange_code(AuthorizationCode::new(code))
+                    .request_async(async_http_client)
+                    .await?;
+                let id_token = token.id_token().unwrap();
+                let claims = id_token.claims(&client.id_token_verifier(), empty_nonce_verifier)?;
+                let subject = claims.subject().to_string();
+                let email = claims
+                    .email()
+                    .map(|e| e.to_string())
+                    .ok_or_else(|| Error::new("Email not found in OIDC token claims"))?;
+                Ok(OidcTokenOutput { subject, email })
+            }
+            _ => Err(Error::new("OIDC client not configured")),
+        }
     }
 
     #[cfg(debug_assertions)]

@@ -67,7 +67,7 @@ fn convert_to_format(item: Item, lot: MediaLot) -> ImportOrExportMediaItem {
         source_id: item.title.clone(),
         lot,
         source: MediaSource::Mal,
-        identifier: item.title.clone(),
+        identifier: "".to_string(),
         internal_identifier: Some(ImportOrExportItemIdentifier::NeedsDetails {
             identifier: item.identifier.to_string(),
             title: item.title,
@@ -75,7 +75,6 @@ fn convert_to_format(item: Item, lot: MediaLot) -> ImportOrExportMediaItem {
         seen_history: vec![seen_item],
         reviews: vec![review_item],
         collections: vec![],
-        monitored: None,
     }
 }
 
@@ -91,11 +90,7 @@ pub async fn import(input: DeployMalImportInput) -> Result<ImportResult> {
     }
     Ok(ImportResult {
         media,
-        people: vec![],
-        workouts: vec![],
-        collections: vec![],
-        failed_items: vec![],
-        measurements: vec![],
+        ..Default::default()
     })
 }
 

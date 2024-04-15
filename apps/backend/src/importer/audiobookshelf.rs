@@ -90,14 +90,13 @@ pub async fn import(input: DeployAudiobookshelfImportInput) -> Result<ImportResu
                             lot,
                             source: MediaSource::Audible,
                             source_id: metadata.title.unwrap_or_default(),
-                            identifier: item.id,
+                            identifier: "".to_string(),
                             seen_history: vec![ImportOrExportMediaItemSeen {
                                 provider_watched_on: Some(ImportSource::Audiobookshelf.to_string()),
                                 ..Default::default()
                             }],
                             collections: vec![],
                             reviews: vec![],
-                            monitored: None,
                         })
                     } else {
                         failed_items.push(ImportFailedItem {
@@ -122,9 +121,6 @@ pub async fn import(input: DeployAudiobookshelfImportInput) -> Result<ImportResu
     Ok(ImportResult {
         media,
         failed_items,
-        people: vec![],
-        workouts: vec![],
-        collections: vec![],
-        measurements: vec![],
+        ..Default::default()
     })
 }

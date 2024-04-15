@@ -46,13 +46,13 @@ import {
 import {
 	CreateReminderModal,
 	DisplayCollection,
-	DisplayMediaMonitored,
 	DisplayMediaReminder,
 	MediaIsPartial,
 	MediaScrollArea,
 	type PostReview,
 	PostReviewModal,
 	ReviewItemDisplay,
+	ToggleMediaMonitorMenuItem,
 } from "~/components/media";
 import {
 	createToastHeaders,
@@ -97,7 +97,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 	return json({
 		query,
 		personId,
-		userPreferences: { reviewScale: userPreferences.general.reviewScale },
+		userPreferences: {
+			reviewScale: userPreferences.general.reviewScale,
+			disableReviews: userPreferences.general.disableReviews,
+		},
 		coreDetails: { itemDetailsHeight: coreDetails.itemDetailsHeight },
 		userDetails,
 		collections,
@@ -224,9 +227,6 @@ export default function Page() {
 						{loaderData.personDetails.details.isPartial ? (
 							<MediaIsPartial mediaType="person" />
 						) : null}
-						{loaderData.userPersonDetails.isMonitored ? (
-							<DisplayMediaMonitored entityLot="person" />
-						) : null}
 					</Group>
 					{loaderData.userPersonDetails.reminder ? (
 						<DisplayMediaReminder
@@ -246,7 +246,7 @@ export default function Page() {
 									Overview
 								</Tabs.Tab>
 							) : null}
-							{loaderData.userPersonDetails.reviews.length > 0 ? (
+							{!loaderData.userPreferences.disableReviews ? (
 								<Tabs.Tab
 									value="reviews"
 									leftSection={<IconMessageCircle2 size={16} />}
@@ -342,37 +342,13 @@ export default function Page() {
 											<Button variant="outline">More actions</Button>
 										</Menu.Target>
 										<Menu.Dropdown>
-											<Form
-												action="/actions?intent=toggleMediaMonitor"
-												method="post"
-												replace
-											>
-												<HiddenLocationInput />
-												<Menu.Item
-													type="submit"
-													color={
-														loaderData.userPersonDetails.isMonitored
-															? "red"
-															: undefined
-													}
-													name="personId"
-													value={loaderData.personId}
-													onClick={(e) => {
-														if (loaderData.userPersonDetails.isMonitored)
-															if (
-																!confirm(
-																	"Are you sure you want to stop monitoring this person?",
-																)
-															)
-																e.preventDefault();
-													}}
-												>
-													{loaderData.userPersonDetails.isMonitored
-														? "Stop"
-														: "Start"}{" "}
-													monitoring
-												</Menu.Item>
-											</Form>
+											<ToggleMediaMonitorMenuItem
+												inCollections={loaderData.userPersonDetails.collections.map(
+													(c) => c.name,
+												)}
+												formValue={loaderData.personId}
+												entityLot={EntityLot.Person}
+											/>
 											{loaderData.userPersonDetails.reminder ? (
 												<Form
 													action="/actions?intent=deleteMediaReminder"
@@ -431,25 +407,27 @@ export default function Page() {
 								</SimpleGrid>
 							</MediaScrollArea>
 						</Tabs.Panel>
-						<Tabs.Panel value="reviews">
-							<MediaScrollArea
-								itemDetailsHeight={loaderData.coreDetails.itemDetailsHeight}
-							>
-								<Stack>
-									{loaderData.userPersonDetails.reviews.map((r) => (
-										<ReviewItemDisplay
-											review={r}
-											key={r.id}
-											personId={loaderData.personId}
-											title={loaderData.personDetails.details.name}
-											user={loaderData.userDetails}
-											reviewScale={loaderData.userPreferences.reviewScale}
-											entityType="person"
-										/>
-									))}
-								</Stack>
-							</MediaScrollArea>
-						</Tabs.Panel>
+						{!loaderData.userPreferences.disableReviews ? (
+							<Tabs.Panel value="reviews">
+								<MediaScrollArea
+									itemDetailsHeight={loaderData.coreDetails.itemDetailsHeight}
+								>
+									<Stack>
+										{loaderData.userPersonDetails.reviews.map((r) => (
+											<ReviewItemDisplay
+												review={r}
+												key={r.id}
+												personId={loaderData.personId}
+												title={loaderData.personDetails.details.name}
+												user={loaderData.userDetails}
+												reviewScale={loaderData.userPreferences.reviewScale}
+												entityType="person"
+											/>
+										))}
+									</Stack>
+								</MediaScrollArea>
+							</Tabs.Panel>
+						) : null}
 					</Tabs>
 				</MediaDetailsLayout>
 			</Container>

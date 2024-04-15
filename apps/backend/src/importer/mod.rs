@@ -25,9 +25,9 @@ use crate::{
         fitness::UserWorkoutInput,
         media::{
             CommitPersonInput, CreateOrUpdateCollectionInput, ImportOrExportItemIdentifier,
-            ImportOrExportItemRating, ImportOrExportMediaItem, ImportOrExportPersonItem,
-            PartialMetadataWithoutId, PostReviewInput, ProgressUpdateInput,
-            ToggleMediaMonitorInput,
+            ImportOrExportItemRating, ImportOrExportMediaGroupItem, ImportOrExportMediaItem,
+            ImportOrExportPersonItem, PartialMetadataWithoutId, PostReviewInput,
+            ProgressUpdateInput,
         },
         BackgroundJob, ChangeCollectionToEntityInput, IdObject,
     },
@@ -38,6 +38,7 @@ use crate::{
 
 mod audiobookshelf;
 mod goodreads;
+mod imdb;
 mod json;
 mod mal;
 mod media_tracker;
@@ -56,6 +57,12 @@ pub struct DeployMediaTrackerImportInput {
 
 #[derive(Debug, InputObject, Serialize, Deserialize, Clone)]
 pub struct DeployGoodreadsImportInput {
+    // The file path of the uploaded CSV export file.
+    csv_path: String,
+}
+
+#[derive(Debug, InputObject, Serialize, Deserialize, Clone)]
+pub struct DeployImdbImportInput {
     // The file path of the uploaded CSV export file.
     csv_path: String,
 }
@@ -128,6 +135,7 @@ pub struct DeployImportJobInput {
     pub strong_app: Option<DeployStrongAppImportInput>,
     pub audiobookshelf: Option<DeployAudiobookshelfImportInput>,
     pub json: Option<DeployJsonImportInput>,
+    pub imdb: Option<DeployImdbImportInput>,
 }
 
 /// The various steps in which media importing can fail
@@ -160,10 +168,11 @@ pub struct ImportDetails {
     pub total: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ImportResult {
     collections: Vec<CreateOrUpdateCollectionInput>,
     media: Vec<ImportOrExportMediaItem>,
+    media_groups: Vec<ImportOrExportMediaGroupItem>,
     failed_items: Vec<ImportFailedItem>,
     people: Vec<ImportOrExportPersonItem>,
     workouts: Vec<UserWorkoutInput>,
@@ -287,6 +296,7 @@ impl ImporterService {
             }
             ImportSource::PeopleJson => self.import_people(user_id, input).await?,
             ImportSource::MeasurementsJson => self.import_measurements(user_id, input).await?,
+            ImportSource::MediaGroupJson => self.import_media_groups(user_id, input).await?,
             _ => self.import_media(user_id, input).await?,
         };
         self.media_service
@@ -329,7 +339,7 @@ impl ImporterService {
                 .await?;
             for review in item.reviews.iter() {
                 if let Some(input) =
-                    convert_review_into_input(review, &preferences, None, Some(person.id))
+                    convert_review_into_input(review, &preferences, None, Some(person.id), None)
                 {
                     if let Err(e) = self.media_service.post_review(user_id, input).await {
                         import.failed_items.push(ImportFailedItem {
@@ -363,16 +373,6 @@ impl ImporterService {
                     .await
                     .ok();
             }
-            self.media_service
-                .toggle_media_monitor(
-                    user_id,
-                    ToggleMediaMonitorInput {
-                        person_id: Some(person.id),
-                        force_value: item.monitored,
-                        ..Default::default()
-                    },
-                )
-                .await?;
             tracing::debug!(
                 "Imported person: {idx}/{total}, name: {name}",
                 idx = idx + 1,
@@ -446,6 +446,119 @@ impl ImporterService {
     }
 
     #[instrument(skip(self, input))]
+    async fn import_media_groups(
+        &self,
+        user_id: i32,
+        input: Box<DeployImportJobInput>,
+    ) -> Result<()> {
+        let db_import_job = self.start_import_job(user_id, input.source).await?;
+        let mut import = match input.source {
+            ImportSource::MediaGroupJson => json::media_groups_import(input.json.unwrap())
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        let preferences =
+            partial_user_by_id::<UserWithOnlyPreferences>(&self.media_service.db, user_id)
+                .await?
+                .preferences;
+        import.media = import
+            .media
+            .into_iter()
+            .sorted_unstable_by_key(|m| {
+                m.seen_history.len() + m.reviews.len() + m.collections.len()
+            })
+            .rev()
+            .collect_vec();
+        for col_details in import.collections.into_iter() {
+            self.media_service
+                .create_or_update_collection(user_id, col_details)
+                .await?;
+        }
+        for (idx, item) in import.media_groups.iter().enumerate() {
+            tracing::debug!(
+                "Importing media group with identifier = {iden}",
+                iden = &item.title
+            );
+            let rev_length = item.reviews.len();
+            let data = self
+                .media_service
+                .commit_metadata_group_internal(&item.identifier, item.lot, item.source)
+                .await;
+            let metadata_id = match data {
+                Ok(r) => r.0,
+                Err(e) => {
+                    tracing::error!("{e:?}");
+                    import.failed_items.push(ImportFailedItem {
+                        lot: Some(item.lot),
+                        step: ImportFailStep::MediaDetailsFromProvider,
+                        identifier: item.title.to_owned(),
+                        error: Some(e.message),
+                    });
+                    continue;
+                }
+            };
+            for review in item.reviews.iter() {
+                if let Some(input) =
+                    convert_review_into_input(review, &preferences, None, None, Some(metadata_id))
+                {
+                    if let Err(e) = self.media_service.post_review(user_id, input).await {
+                        import.failed_items.push(ImportFailedItem {
+                            lot: Some(item.lot),
+                            step: ImportFailStep::ReviewConversion,
+                            identifier: item.title.to_owned(),
+                            error: Some(e.message),
+                        });
+                    };
+                }
+            }
+            for col in item.collections.iter() {
+                self.media_service
+                    .create_or_update_collection(
+                        user_id,
+                        CreateOrUpdateCollectionInput {
+                            name: col.to_string(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                self.media_service
+                    .add_entity_to_collection(
+                        user_id,
+                        ChangeCollectionToEntityInput {
+                            collection_name: col.to_string(),
+                            metadata_id: Some(metadata_id),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .ok();
+            }
+            tracing::debug!(
+                "Imported item: {idx}/{total}, lot: {lot}, review count: {rev}, collection count: {col}",
+                idx = idx + 1,
+                total = import.media.len(),
+                lot = item.lot,
+                rev = rev_length,
+                col = item.collections.len(),
+            );
+        }
+        tracing::debug!(
+            "Imported {total} media group items from {source}",
+            total = import.media.len(),
+            source = db_import_job.source
+        );
+        let details = ImportResultResponse {
+            import: ImportDetails {
+                total: import.media.len(),
+            },
+            failed_items: import.failed_items,
+        };
+        self.finish_import_job(db_import_job, details).await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self, input))]
     async fn import_media(&self, user_id: i32, input: Box<DeployImportJobInput>) -> Result<()> {
         let db_import_job = self.start_import_job(user_id, input.source).await?;
         let mut import = match input.source {
@@ -471,6 +584,16 @@ impl ImporterService {
             ImportSource::Audiobookshelf => audiobookshelf::import(input.audiobookshelf.unwrap())
                 .await
                 .unwrap(),
+            ImportSource::Imdb => imdb::import(
+                input.imdb.unwrap(),
+                &self
+                    .media_service
+                    .get_tmdb_non_media_service()
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
             _ => unreachable!(),
         };
         let preferences =
@@ -566,7 +689,7 @@ impl ImporterService {
             }
             for review in item.reviews.iter() {
                 if let Some(input) =
-                    convert_review_into_input(review, &preferences, Some(metadata.id), None)
+                    convert_review_into_input(review, &preferences, Some(metadata.id), None, None)
                 {
                     if let Err(e) = self.media_service.post_review(user_id, input).await {
                         import.failed_items.push(ImportFailedItem {
@@ -600,16 +723,6 @@ impl ImporterService {
                     .await
                     .ok();
             }
-            self.media_service
-                .toggle_media_monitor(
-                    user_id,
-                    ToggleMediaMonitorInput {
-                        metadata_id: Some(metadata.id),
-                        force_value: item.monitored,
-                        ..Default::default()
-                    },
-                )
-                .await?;
             tracing::debug!(
                 "Imported item: {idx}/{total}, lot: {lot}, history count: {hist}, review count: {rev}, collection count: {col}",
                 idx = idx + 1,
@@ -669,6 +782,7 @@ fn convert_review_into_input(
     preferences: &UserPreferences,
     metadata_id: Option<i32>,
     person_id: Option<i32>,
+    metadata_group_id: Option<i32>,
 ) -> Option<PostReviewInput> {
     if review.review.is_none() && review.rating.is_none() {
         tracing::debug!("Skipping review since it has no content");
@@ -689,6 +803,7 @@ fn convert_review_into_input(
         date: date.flatten(),
         metadata_id,
         person_id,
+        metadata_group_id,
         show_season_number: review.show_season_number,
         show_episode_number: review.show_episode_number,
         podcast_episode_number: review.podcast_episode_number,

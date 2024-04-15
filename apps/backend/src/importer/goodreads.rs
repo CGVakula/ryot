@@ -21,8 +21,6 @@ use crate::{
 
 #[derive(Debug, Deserialize)]
 struct Book {
-    #[serde(rename = "Book Id")]
-    id: String,
     #[serde(rename = "Title")]
     title: String,
     #[serde(rename = "ISBN13")]
@@ -135,7 +133,7 @@ pub async fn import(
                 source_id: record.title.clone(),
                 lot,
                 source,
-                identifier: record.id,
+                identifier: "".to_string(),
                 internal_identifier: Some(ImportOrExportItemIdentifier::NeedsDetails {
                     identifier,
                     title: record.title,
@@ -143,7 +141,6 @@ pub async fn import(
                 seen_history,
                 reviews,
                 collections,
-                monitored: None,
             });
         } else {
             failed_items.push(ImportFailedItem {
@@ -160,9 +157,6 @@ pub async fn import(
     Ok(ImportResult {
         media,
         failed_items,
-        people: vec![],
-        workouts: vec![],
-        collections: vec![],
-        measurements: vec![],
+        ..Default::default()
     })
 }

@@ -40,7 +40,6 @@ import {
 	CreateOwnershipModal,
 	CreateReminderModal,
 	DisplayCollection,
-	DisplayMediaMonitored,
 	DisplayMediaOwned,
 	DisplayMediaReminder,
 	MediaIsPartial,
@@ -49,6 +48,7 @@ import {
 	type PostReview,
 	PostReviewModal,
 	ReviewItemDisplay,
+	ToggleMediaMonitorMenuItem,
 } from "~/components/media";
 import {
 	getAuthorizationHeader,
@@ -91,7 +91,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 	return json({
 		query,
 		coreDetails: { itemDetailsHeight: coreDetails.itemDetailsHeight },
-		userPreferences: { reviewScale: userPreferences.general.reviewScale },
+		userPreferences: {
+			reviewScale: userPreferences.general.reviewScale,
+			disableReviews: userPreferences.general.disableReviews,
+		},
 		userDetails,
 		collections,
 		metadataGroupId,
@@ -183,9 +186,6 @@ export default function Page() {
 						{loaderData.userMetadataGroupDetails.ownership ? (
 							<DisplayMediaOwned />
 						) : null}
-						{loaderData.userMetadataGroupDetails.isMonitored ? (
-							<DisplayMediaMonitored entityLot="group" />
-						) : null}
 						{loaderData.metadataGroupDetails.details.isPartial ? (
 							<MediaIsPartial mediaType="group" />
 						) : null}
@@ -203,7 +203,7 @@ export default function Page() {
 							<Tabs.Tab value="actions" leftSection={<IconUser size={16} />}>
 								Actions
 							</Tabs.Tab>
-							{loaderData.userMetadataGroupDetails.reviews.length > 0 ? (
+							{!loaderData.userPreferences.disableReviews ? (
 								<Tabs.Tab
 									value="reviews"
 									leftSection={<IconMessageCircle2 size={16} />}
@@ -255,6 +255,13 @@ export default function Page() {
 											<Button variant="outline">More actions</Button>
 										</Menu.Target>
 										<Menu.Dropdown>
+											<ToggleMediaMonitorMenuItem
+												inCollections={loaderData.userMetadataGroupDetails.collections.map(
+													(c) => c.name,
+												)}
+												formValue={loaderData.metadataGroupId}
+												entityLot={EntityLot.MediaGroup}
+											/>
 											{loaderData.userMetadataGroupDetails.ownership ? (
 												<Form
 													action="/actions?intent=toggleMediaOwnership"
@@ -317,61 +324,32 @@ export default function Page() {
 													Create reminder
 												</Menu.Item>
 											)}
-											<Form
-												action="/actions?intent=toggleMediaMonitor"
-												method="post"
-												replace
-											>
-												<HiddenLocationInput />
-												<Menu.Item
-													type="submit"
-													color={
-														loaderData.userMetadataGroupDetails.isMonitored
-															? "red"
-															: undefined
-													}
-													name="metadataGroupId"
-													value={loaderData.metadataGroupId}
-													onClick={(e) => {
-														if (loaderData.userMetadataGroupDetails.isMonitored)
-															if (
-																!confirm(
-																	"Are you sure you want to stop monitoring this person?",
-																)
-															)
-																e.preventDefault();
-													}}
-												>
-													{loaderData.userMetadataGroupDetails.isMonitored
-														? "Stop"
-														: "Start"}{" "}
-													monitoring
-												</Menu.Item>
-											</Form>
 										</Menu.Dropdown>
 									</Menu>
 								</SimpleGrid>
 							</MediaScrollArea>
 						</Tabs.Panel>
-						<Tabs.Panel value="reviews">
-							<MediaScrollArea
-								itemDetailsHeight={loaderData.coreDetails.itemDetailsHeight}
-							>
-								<Stack>
-									{loaderData.userMetadataGroupDetails.reviews.map((r) => (
-										<ReviewItemDisplay
-											review={r}
-											key={r.id}
-											metadataGroupId={loaderData.metadataGroupId}
-											reviewScale={loaderData.userPreferences.reviewScale}
-											user={loaderData.userDetails}
-											title={loaderData.metadataGroupDetails.details.title}
-											entityType="metadataGroup"
-										/>
-									))}
-								</Stack>
-							</MediaScrollArea>
-						</Tabs.Panel>
+						{!loaderData.userPreferences.disableReviews ? (
+							<Tabs.Panel value="reviews">
+								<MediaScrollArea
+									itemDetailsHeight={loaderData.coreDetails.itemDetailsHeight}
+								>
+									<Stack>
+										{loaderData.userMetadataGroupDetails.reviews.map((r) => (
+											<ReviewItemDisplay
+												review={r}
+												key={r.id}
+												metadataGroupId={loaderData.metadataGroupId}
+												reviewScale={loaderData.userPreferences.reviewScale}
+												user={loaderData.userDetails}
+												title={loaderData.metadataGroupDetails.details.title}
+												entityType="metadataGroup"
+											/>
+										))}
+									</Stack>
+								</MediaScrollArea>
+							</Tabs.Panel>
+						) : null}
 					</Tabs>
 				</MediaDetailsLayout>
 			</Container>

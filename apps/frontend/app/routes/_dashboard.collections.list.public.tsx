@@ -5,6 +5,7 @@ import {
 	Center,
 	Container,
 	Group,
+	Pagination,
 	Stack,
 	Text,
 	Title,
@@ -18,11 +19,7 @@ import { Link, useLoaderData } from "@remix-run/react";
 import { PublicCollectionsListDocument } from "@ryot/generated/graphql/backend/graphql";
 import { z } from "zod";
 import { zx } from "zodix";
-import {
-	ApplicationGrid,
-	ApplicationPagination,
-	DebouncedSearchInput,
-} from "~/components/common";
+import { ApplicationGrid, DebouncedSearchInput } from "~/components/common";
 import { useGetMantineColor, useSearchParam } from "~/lib/hooks";
 import { getCoreDetails, gqlClient } from "~/lib/utilities.server";
 
@@ -74,7 +71,7 @@ export default function Page() {
 							</Box>
 							<ApplicationGrid>
 								{loaderData.publicCollectionsList.items.map((c) => (
-									<Group key={c.id}>
+									<Group key={c.id} wrap="nowrap">
 										<Box
 											h={11}
 											w={11}
@@ -86,7 +83,9 @@ export default function Page() {
 												component={Link}
 												to={$path("/collections/:id", { id: c.id })}
 											>
-												<Title order={4}>{c.name}</Title>
+												<Title order={4} lineClamp={1}>
+													{c.name}
+												</Title>
 											</Anchor>
 											<Text c="dimmed" size="xs">
 												by {c.username}
@@ -101,9 +100,9 @@ export default function Page() {
 					)}
 					{loaderData.publicCollectionsList ? (
 						<Center mt="xl">
-							<ApplicationPagination
+							<Pagination
 								size="sm"
-								defaultValue={loaderData.query.page}
+								value={loaderData.query.page}
 								onChange={(v) => setP("page", v.toString())}
 								total={Math.ceil(
 									loaderData.publicCollectionsList.details.total /

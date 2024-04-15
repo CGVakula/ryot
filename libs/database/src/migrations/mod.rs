@@ -72,6 +72,15 @@ mod m20240330_add_is_partial_field_to_metadata_group;
 mod m20240401_0_change_seen_progress_type;
 mod m20240401_1_add_provider_watched_on_to_seen;
 mod m20240401_2_add_watch_providers_preferences;
+mod m20240402_0_create_monitored_collection_for_existing_users;
+mod m20240402_1_create_collection_to_entity_entries_for_monitoring_media;
+mod m20240402_2_drop_media_monitored_column_from_user_to_entity;
+mod m20240402_3_change_name_of_reason;
+mod m20240403_add_total_time_spent_column_to_seen;
+mod m20240408_0_add_disable_reviews_to_preferences;
+mod m20240408_1_add_oidc_issuer_id_to_user;
+mod m20240408_2_cleanup_user;
+mod m20240410_change_unique_constraints_to_indices;
 
 pub use m20230410_create_metadata::Metadata as AliasedMetadata;
 pub use m20230413_create_person::Person as AliasedPerson;
@@ -161,6 +170,17 @@ impl MigratorTrait for Migrator {
             Box::new(m20240401_0_change_seen_progress_type::Migration),
             Box::new(m20240401_1_add_provider_watched_on_to_seen::Migration),
             Box::new(m20240401_2_add_watch_providers_preferences::Migration),
+            Box::new(m20240402_0_create_monitored_collection_for_existing_users::Migration),
+            Box::new(
+                m20240402_1_create_collection_to_entity_entries_for_monitoring_media::Migration,
+            ),
+            Box::new(m20240402_2_drop_media_monitored_column_from_user_to_entity::Migration),
+            Box::new(m20240402_3_change_name_of_reason::Migration),
+            Box::new(m20240403_add_total_time_spent_column_to_seen::Migration),
+            Box::new(m20240408_0_add_disable_reviews_to_preferences::Migration),
+            Box::new(m20240408_1_add_oidc_issuer_id_to_user::Migration),
+            Box::new(m20240408_2_cleanup_user::Migration),
+            Box::new(m20240410_change_unique_constraints_to_indices::Migration),
         ]
     }
 }

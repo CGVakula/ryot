@@ -160,6 +160,8 @@ pub enum ImportSource {
     Audiobookshelf,
     #[sea_orm(string_value = "GO")]
     Goodreads,
+    #[sea_orm(string_value = "IM")]
+    Imdb,
     #[sea_orm(string_value = "MA")]
     Mal,
     #[sea_orm(string_value = "MEJ")]
@@ -168,6 +170,8 @@ pub enum ImportSource {
     MediaTracker,
     #[sea_orm(string_value = "MJ")]
     MediaJson,
+    #[sea_orm(string_value = "MGJ")]
+    MediaGroupJson,
     #[sea_orm(string_value = "PJ")]
     PeopleJson,
     #[sea_orm(string_value = "TR")]

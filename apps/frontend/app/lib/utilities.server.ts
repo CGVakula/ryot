@@ -31,7 +31,7 @@ import { zx } from "zodix";
 import { redirectToQueryParam } from "./generals";
 
 const isProduction = process.env.NODE_ENV === "production";
-export const API_URL = process.env.API_URL || "http://localhost:5000";
+export const API_URL = process.env.API_URL || "http://localhost:8000/backend";
 
 export const gqlClient = new GraphQLClient(`${API_URL}/graphql`, {
 	headers: { Connection: "keep-alive" },
@@ -70,25 +70,7 @@ export const getIsAuthenticated = async (request: Request) => {
 
 export const redirectIfNotAuthenticatedOrUpdated = async (request: Request) => {
 	const [isAuthenticated, userDetails] = await getIsAuthenticated(request);
-	const runningKey = await runningKeyCookie.parse(
-		request.headers.get("cookie") || "",
-	);
 	const nextUrl = withoutHost(request.url);
-	if (runningKey !== serverVariables.RUNNING_KEY) {
-		throw redirect(
-			withQuery($path("/auth/login"), { [redirectToQueryParam]: nextUrl }),
-			{
-				status: 302,
-				headers: combineHeaders(
-					await createToastHeaders({
-						message: "Ryot has been updated, please log in again",
-						type: "error",
-					}),
-					await getLogoutCookies(),
-				),
-			},
-		);
-	}
 	if (!isAuthenticated || userDetails.__typename !== "User") {
 		throw redirect(
 			withQuery($path("/auth/login"), { [redirectToQueryParam]: nextUrl }),
@@ -108,9 +90,6 @@ export const redirectIfNotAuthenticatedOrUpdated = async (request: Request) => {
 };
 
 const expectedServerVariables = z.object({
-	RUNNING_KEY: z
-		.string()
-		.default(() => (isProduction ? crypto.randomUUID() : "s3cr3t")),
 	DISABLE_TELEMETRY: z
 		.string()
 		.optional()
@@ -143,9 +122,9 @@ export function combineHeaders(
 export type ApplicationUser = {
 	__typename: "User";
 	id: number;
-	email?: string | null | undefined;
 	name: string;
 	lot: UserLot;
+	oidcIssuerId?: string;
 	isDemo: boolean;
 };
 
@@ -285,8 +264,6 @@ export const userDetailsCookie = createCookie(
 	commonCookieOptions,
 );
 
-export const runningKeyCookie = createCookie("RunningKey", commonCookieOptions);
-
 export const toastSessionStorage = createCookieSessionStorage({
 	cookie: { ...commonCookieOptions, name: "Toast" },
 });
@@ -400,11 +377,6 @@ export const getLogoutCookies = async () => {
 		},
 		{
 			"set-cookie": await userDetailsCookie.serialize("", {
-				expires: new Date(0),
-			}),
-		},
-		{
-			"set-cookie": await runningKeyCookie.serialize("", {
 				expires: new Date(0),
 			}),
 		},

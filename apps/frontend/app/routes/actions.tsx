@@ -20,7 +20,6 @@ import {
 	MediaSource,
 	PostReviewDocument,
 	RemoveEntityFromCollectionDocument,
-	ToggleMediaMonitorDocument,
 	ToggleMediaOwnershipDocument,
 	Visibility,
 } from "@ryot/generated/graphql/backend/graphql";
@@ -136,24 +135,15 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 			const [submission, input] =
 				getChangeCollectionToEntityVariables(formData);
 			for (const collectionName of submission.collectionName) {
-				if (collectionName === "Watchlist") {
+				const addTo = [collectionName];
+				if (collectionName === "Watchlist") addTo.push("Monitoring");
+				for (const co of addTo) {
 					await gqlClient.request(
-						ToggleMediaMonitorDocument,
-						{
-							input: {
-								forceValue: true,
-								metadataId: input.metadataId,
-								personId: input.personId,
-							},
-						},
+						AddEntityToCollectionDocument,
+						{ input: { ...input, collectionName: co } },
 						await getAuthorizationHeader(request),
 					);
 				}
-				await gqlClient.request(
-					AddEntityToCollectionDocument,
-					{ input: { ...input, collectionName } },
-					await getAuthorizationHeader(request),
-				);
 			}
 			headers = await createToastHeaders({
 				message: "Media added to collection successfully",
@@ -240,21 +230,6 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 				message: "Ownership toggled successfully",
 			});
 		})
-		.with("toggleMediaMonitor", async () => {
-			const submission = processSubmission(
-				formData,
-				metadataOrPersonOrMetadataGroupIdSchema,
-			);
-			await gqlClient.request(
-				ToggleMediaMonitorDocument,
-				{ input: submission },
-				await getAuthorizationHeader(request),
-			);
-			headers = await createToastHeaders({
-				type: "success",
-				message: "Monitor toggled successfully",
-			});
-		})
 		.run();
 	if (Object.keys(returnData).length > 0) return json(returnData, { headers });
 	return redirect(redirectTo, { headers });
@@ -323,7 +298,7 @@ const getChangeCollectionToEntityVariables = (formData: FormData) => {
 		submission.entityLot === EntityLot.Media
 			? Number(submission.entityId)
 			: undefined;
-	const mediaGroupId =
+	const metadataGroupId =
 		submission.entityLot === EntityLot.MediaGroup
 			? Number(submission.entityId)
 			: undefined;
@@ -337,6 +312,6 @@ const getChangeCollectionToEntityVariables = (formData: FormData) => {
 			: undefined;
 	return [
 		submission,
-		{ metadataId, mediaGroupId, exerciseId, personId },
+		{ metadataId, metadataGroupId, exerciseId, personId },
 	] as const;
 };

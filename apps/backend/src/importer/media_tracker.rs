@@ -161,7 +161,7 @@ pub async fn import(input: DeployMediaTrackerImportInput) -> Result<ImportResult
         .unwrap();
     let mut lists: Vec<ListResponse> = rsp.body_json().await.unwrap();
 
-    let all_collections = lists
+    let collections = lists
         .iter()
         .map(|l| CreateOrUpdateCollectionInput {
             name: l.name.clone(),
@@ -362,16 +362,13 @@ pub async fn import(input: DeployMediaTrackerImportInput) -> Result<ImportResult
                     }
                 })
                 .collect(),
-            monitored: None,
         };
         final_data.push(item);
     }
     Ok(ImportResult {
         media: final_data,
         failed_items,
-        collections: all_collections,
-        people: vec![],
-        workouts: vec![],
-        measurements: vec![],
+        collections,
+        ..Default::default()
     })
 }

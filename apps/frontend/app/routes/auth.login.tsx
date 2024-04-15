@@ -1,6 +1,14 @@
 import { getFormProps, getInputProps, useForm } from "@conform-to/react";
 import { $path } from "@ignisda/remix-routes";
-import { Anchor, Box, Button, PasswordInput, TextInput } from "@mantine/core";
+import {
+	Anchor,
+	Box,
+	Button,
+	Divider,
+	PasswordInput,
+	Stack,
+	TextInput,
+} from "@mantine/core";
 import {
 	type ActionFunctionArgs,
 	type LoaderFunctionArgs,
@@ -14,22 +22,22 @@ import {
 	LoginErrorVariant,
 	LoginUserDocument,
 } from "@ryot/generated/graphql/backend/graphql";
+import { IconAt } from "@tabler/icons-react";
 import { safeRedirect } from "remix-utils/safe-redirect";
 import { match } from "ts-pattern";
 import { z } from "zod";
+import { zx } from "zodix";
 import { redirectToQueryParam } from "~/lib/generals";
 import {
 	authCookie,
 	combineHeaders,
 	createToastHeaders,
-	serverVariables,
 	getCookiesForApplication,
 	getCoreEnabledFeatures,
 	getIsAuthenticated,
 	gqlClient,
 	processSubmission,
 	redirectWithToast,
-	runningKeyCookie,
 } from "~/lib/utilities.server";
 import classes from "~/styles/auth.module.css";
 
@@ -39,9 +47,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 		return redirectWithToast($path("/"), {
 			message: "You were already logged in",
 		});
-	const enabledFeatures = await getCoreEnabledFeatures();
+	const [enabledFeatures, { coreDetails }] = await Promise.all([
+		getCoreEnabledFeatures(),
+		gqlClient.request(CoreDetailsDocument),
+	]);
 	return json({
 		enabledFeatures: { signupAllowed: enabledFeatures.signupAllowed },
+		tokenValidForDays: coreDetails.tokenValidForDays,
+		oidcEnabled: coreDetails.oidcEnabled,
 	});
 };
 
@@ -52,28 +65,21 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 	const submission = processSubmission(formData, schema);
 	const { loginUser } = await gqlClient.request(LoginUserDocument, {
 		input: {
-			password: submission.password,
-			username: submission.username,
+			password: {
+				password: submission.password,
+				username: submission.username,
+			},
 		},
 	});
-	const { coreDetails } = await gqlClient.request(CoreDetailsDocument);
 	if (loginUser.__typename === "LoginResponse") {
 		let redirectUrl = $path("/");
 		if (submission[redirectToQueryParam])
 			redirectUrl = safeRedirect(submission[redirectToQueryParam]);
 		const cookies = await getCookiesForApplication(loginUser.apiKey);
-		const options = {
-			maxAge: coreDetails.tokenValidForDays * 24 * 60 * 60,
-		} as const;
+		const options = { maxAge: submission.tokenValidForDays * 24 * 60 * 60 };
 		return redirect(redirectUrl, {
 			headers: combineHeaders(
 				{ "set-cookie": await authCookie.serialize(loginUser.apiKey, options) },
-				{
-					"set-cookie": await runningKeyCookie.serialize(
-						serverVariables.RUNNING_KEY,
-						options,
-					),
-				},
 				cookies,
 			),
 		});
@@ -86,6 +92,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 		.with(
 			LoginErrorVariant.UsernameDoesNotExist,
 			() => "The username provided does not exist",
+		)
+		.with(
+			LoginErrorVariant.IncorrectProviderChosen,
+			() => "The provider chosen was incorrect",
 		)
 		.exhaustive();
 	return json({ status: "error", submission, message } as const, {
@@ -100,6 +110,7 @@ const schema = z.object({
 	username: z.string(),
 	password: z.string(),
 	[redirectToQueryParam]: z.string().optional(),
+	tokenValidForDays: zx.NumAsString,
 });
 
 type Schema = z.infer<typeof schema>;
@@ -112,38 +123,55 @@ export default function Page() {
 
 	return (
 		<>
-			<Box
-				component={Form}
-				m="auto"
-				className={classes.form}
-				method="post"
-				{...getFormProps(form)}
-			>
-				<TextInput
-					{...getInputProps(fields.username, { type: "text" })}
-					label="Username"
-					autoFocus
-					required
-				/>
-				<PasswordInput
-					label="Password"
-					{...getInputProps(fields.password, { type: "password" })}
-					mt="md"
-					required
-					error={fields.password.errors?.[0]}
-				/>
-				{redirectValue ? (
+			<Stack m="auto" className={classes.form}>
+				<Form method="post" replace {...getFormProps(form)}>
 					<input
 						type="hidden"
-						name={redirectToQueryParam}
-						value={redirectValue}
+						name="tokenValidForDays"
+						value={loaderData.tokenValidForDays}
 					/>
+					<TextInput
+						{...getInputProps(fields.username, { type: "text" })}
+						label="Username"
+						autoFocus
+						required
+					/>
+					<PasswordInput
+						label="Password"
+						{...getInputProps(fields.password, { type: "password" })}
+						mt="md"
+						required
+						error={fields.password.errors?.[0]}
+					/>
+					{redirectValue ? (
+						<input
+							type="hidden"
+							name={redirectToQueryParam}
+							value={redirectValue}
+						/>
+					) : null}
+					<Button id="submit-button" mt="md" type="submit" w="100%">
+						Login
+					</Button>
+				</Form>
+				{loaderData.oidcEnabled ? (
+					<>
+						<Divider label="OR" />
+						<Form method="post" action="/api/auth" replace>
+							<Button
+								variant="outline"
+								color="gray"
+								w="100%"
+								type="submit"
+								leftSection={<IconAt size={16} />}
+							>
+								Continue with OpenID Connect
+							</Button>
+						</Form>
+					</>
 				) : null}
-				<Button id="submit-button" mt="md" type="submit" w="100%">
-					Login
-				</Button>
 				{loaderData.enabledFeatures.signupAllowed ? (
-					<Box mt="lg" ta="right">
+					<Box mt={loaderData.oidcEnabled ? "xl" : undefined} ta="right">
 						Create a{" "}
 						<Anchor to={$path("/auth/register")} component={Link}>
 							new account
@@ -151,7 +179,7 @@ export default function Page() {
 						?
 					</Box>
 				) : null}
-			</Box>
+			</Stack>
 		</>
 	);
 }

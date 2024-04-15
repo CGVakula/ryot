@@ -136,6 +136,8 @@ pub struct CompleteExport {
     pub measurements: Option<Vec<user_measurement::Model>>,
     /// Data about user's workouts.
     pub workouts: Option<Vec<workout::Model>>,
+    /// Data about user's media groups.
+    pub media_group: Option<Vec<media::ImportOrExportMediaGroupItem>>,
 }
 
 #[derive(Debug, InputObject, Default)]
@@ -143,7 +145,7 @@ pub struct ChangeCollectionToEntityInput {
     pub collection_name: String,
     pub metadata_id: Option<i32>,
     pub person_id: Option<i32>,
-    pub media_group_id: Option<i32>,
+    pub metadata_group_id: Option<i32>,
     pub exercise_id: Option<String>,
 }
 
@@ -155,11 +157,12 @@ pub struct IdAndNamedObject {
 }
 
 #[derive(Enum, Eq, PartialEq, Copy, Clone, Debug, Serialize, Deserialize, Display)]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "snake_case")]
 pub enum ExportItem {
     Media,
     People,
     Workouts,
+    MediaGroup,
     Measurements,
 }
 
@@ -899,12 +902,12 @@ pub mod media {
         Reviewed,
         #[sea_orm(string_value = "Collection")]
         Collection,
-        #[sea_orm(string_value = "Monitored")]
-        Monitored,
         #[sea_orm(string_value = "Reminder")]
         Reminder,
         #[sea_orm(string_value = "Owned")]
         Owned,
+        #[sea_orm(string_value = "Monitoring")]
+        Monitoring,
     }
 
     #[derive(Debug, SimpleObject)]
@@ -1118,8 +1121,25 @@ pub mod media {
         pub reviews: Vec<ImportOrExportItemRating>,
         /// The collections this entity was added to.
         pub collections: Vec<String>,
-        /// Whether the media is being monitored.
-        pub monitored: Option<bool>,
+    }
+
+    /// Details about a specific media group item that needs to be imported or exported.
+    #[skip_serializing_none]
+    #[derive(Debug, Serialize, Deserialize, Clone, Schematic)]
+    #[schematic(rename_all = "snake_case")]
+    pub struct ImportOrExportMediaGroupItem {
+        /// Name of the group.
+        pub title: String,
+        /// The type of media.
+        pub lot: MediaLot,
+        /// The source of media.
+        pub source: MediaSource,
+        /// The provider identifier. For eg: TMDB-ID, Openlibrary ID and so on.
+        pub identifier: String,
+        /// The review history for the user.
+        pub reviews: Vec<ImportOrExportItemRating>,
+        /// The collections this entity was added to.
+        pub collections: Vec<String>,
     }
 
     /// Details about a specific creator item that needs to be exported.
@@ -1139,8 +1159,6 @@ pub mod media {
         pub reviews: Vec<ImportOrExportItemRating>,
         /// The collections this entity was added to.
         pub collections: Vec<String>,
-        /// Whether the person is being monitored.
-        pub monitored: Option<bool>,
     }
 
     #[derive(
@@ -1325,14 +1343,6 @@ pub mod media {
         pub image: Option<String>,
         pub lot: MediaLot,
         pub source: MediaSource,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, InputObject, Clone, Default)]
-    pub struct ToggleMediaMonitorInput {
-        pub metadata_id: Option<i32>,
-        pub person_id: Option<i32>,
-        pub metadata_group_id: Option<i32>,
-        pub force_value: Option<bool>,
     }
 
     #[derive(Debug, InputObject)]
